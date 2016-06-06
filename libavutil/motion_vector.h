@@ -54,4 +54,13 @@ typedef struct AVMotionVector {
     uint16_t motion_scale;
 } AVMotionVector;
 
+typedef struct KSM_AVMacroBlockInfo {
+	uint32_t macroblock_no;
+	uint32_t mb_x;
+	uint32_t mb_y;
+	uint32_t mb_stride;
+	uint32_t mb_type;
+	AVMotionVector MV;
+} KSM_AVMacroBlockInfo;
+
 #endif /* AVUTIL_MOTION_VECTOR_H */

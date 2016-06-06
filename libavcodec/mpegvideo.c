@@ -1574,6 +1574,22 @@ static int add_mb(AVMotionVector *mb, uint32_t mb_type,
     return 1;
 }
 
+static int ksm_add_mb_info(KSM_AVMacroBlockInfo *mbi, uint32_t mb_type,
+                  int dst_x, int dst_y,
+                  int motion_x, int motion_y, int motion_scale,
+                  int direction, uint32_t mb_x, uint32_t mb_y, uint32_t mb_stride )
+{
+	add_mb(&mbi->MV, mb_type, dst_x, dst_y, motion_x, motion_y, motion_scale, direction);
+	mbi->macroblock_no = mb_x + mb_y * mb_stride;
+	mbi->mb_x = mb_x;
+	mbi->mb_y = mb_y;
+	mbi->mb_stride = mb_stride;
+	mbi->mb_type = mb_type;
+    return 1;
+}
+
+// ksm_add_mb_info() //Define KSM_AVMacroBlockInfo
+
 /**
  * Print debugging info for the given picture.
  */
@@ -1593,6 +1609,8 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
         /* size is width * height * 2 * 4 where 2 is for directions and 4 is
          * for the maximum number of MB (4 MB in case of IS_8x8) */
         AVMotionVector *mvs = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(AVMotionVector));
+        KSM_AVMacroBlockInfo *mbiList = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(KSM_AVMacroBlockInfo));
+        //KSM_AVMacroBlockInfo *mbi = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(KSM_AVMacroBlockInfo)); //Define KSM_AVMacroBlockInfo
         if (!mvs)
             return;
 
@@ -1610,6 +1628,7 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
                                       (mb_y * 2 + (i >> 1)) * mv_stride) << (mv_sample_log2 - 1);
                             int mx = motion_val[direction][xy][0];
                             int my = motion_val[direction][xy][1];
+                            ksm_add_mb_info(mbiList + mbcount, mb_type, sx, sy, mx, my, scale, direction, mb_x, mb_y, mb_stride);
                             mbcount += add_mb(mvs + mbcount, mb_type, sx, sy, mx, my, scale, direction);
                         }
                     } else if (IS_16X8(mb_type)) {
@@ -1623,6 +1642,7 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
                             if (IS_INTERLACED(mb_type))
                                 my *= 2;
 
+                            ksm_add_mb_info(mbiList + mbcount, mb_type, sx, sy, mx, my, scale, direction, mb_x, mb_y, mb_stride);
                             mbcount += add_mb(mvs + mbcount, mb_type, sx, sy, mx, my, scale, direction);
                         }
                     } else if (IS_8X16(mb_type)) {
@@ -1636,6 +1656,7 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
                             if (IS_INTERLACED(mb_type))
                                 my *= 2;
 
+                            ksm_add_mb_info(mbiList + mbcount, mb_type, sx, sy, mx, my, scale, direction, mb_x, mb_y, mb_stride);
                             mbcount += add_mb(mvs + mbcount, mb_type, sx, sy, mx, my, scale, direction);
                         }
                     } else {
@@ -1644,6 +1665,7 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
                           int xy = (mb_x + mb_y * mv_stride) << mv_sample_log2;
                           int mx = motion_val[direction][xy][0];
                           int my = motion_val[direction][xy][1];
+                          ksm_add_mb_info(mbiList + mbcount, mb_type, sx, sy, mx, my, scale, direction, mb_x, mb_y, mb_stride);
                           mbcount += add_mb(mvs + mbcount, mb_type, sx, sy, mx, my, scale, direction);
                     }
                 }
@@ -1652,6 +1674,7 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
 
         if (mbcount) {
             AVFrameSideData *sd;
+            AVFrameSideData *sdMBinfo; //KSM
 
             av_log(avctx, AV_LOG_DEBUG, "Adding %d MVs info to frame %d\n", mbcount, avctx->frame_number);
             sd = av_frame_new_side_data(pict, AV_FRAME_DATA_MOTION_VECTORS, mbcount * sizeof(AVMotionVector));
@@ -1660,9 +1683,19 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
                 return;
             }
             memcpy(sd->data, mvs, mbcount * sizeof(AVMotionVector));
+
+            // /*KSM
+            sdMBinfo = av_frame_new_side_data(pict, KSM_AV_MACROBLOCK_INFO, mbcount * sizeof(KSM_AVMacroBlockInfo));
+            if (!sdMBinfo) {
+                av_freep(&mbiList);
+                return;
+            }
+            memcpy(sdMBinfo->data, mbiList, mbcount * sizeof(KSM_AVMacroBlockInfo));
+            // */ KSM new side data.
         }
 
         av_freep(&mvs);
+        av_freep(&mbiList);
     }
 
     /* TODO: export all the following to make them accessible for users (and filters) */
