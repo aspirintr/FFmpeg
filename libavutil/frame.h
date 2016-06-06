@@ -94,9 +94,13 @@ enum AVFrameSideDataType {
      */
     AV_FRAME_DATA_MOTION_VECTORS,
     /**
-     * Macroblock information is exported. It also includes motion vector information.
+     * Macroblock information is exported as side data. It also includes motion vector information.
      */
 	KSM_AV_MACROBLOCK_INFO, //KSM
+    /**
+     * Frame information is exported as side data.
+     */
+	KSM_AV_FRAME_INFO, //KSM
     /**
      * Recommmends skipping the specified number of samples. This is exported
      * only if the "skip_manual" AVOption is set in libavcodec.

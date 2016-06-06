@@ -1610,6 +1610,7 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
          * for the maximum number of MB (4 MB in case of IS_8x8) */
         AVMotionVector *mvs = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(AVMotionVector));
         KSM_AVMacroBlockInfo *mbiList = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(KSM_AVMacroBlockInfo));
+        KSM_AVFrameInfo *fri = av_malloc_array(1, sizeof(KSM_AVFrameInfo));
         //KSM_AVMacroBlockInfo *mbi = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(KSM_AVMacroBlockInfo)); //Define KSM_AVMacroBlockInfo
         if (!mvs)
             return;
@@ -1675,6 +1676,7 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
         if (mbcount) {
             AVFrameSideData *sd;
             AVFrameSideData *sdMBinfo; //KSM
+            AVFrameSideData *sdFrameInfo; //KSM
 
             av_log(avctx, AV_LOG_DEBUG, "Adding %d MVs info to frame %d\n", mbcount, avctx->frame_number);
             sd = av_frame_new_side_data(pict, AV_FRAME_DATA_MOTION_VECTORS, mbcount * sizeof(AVMotionVector));
@@ -1691,11 +1693,22 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
                 return;
             }
             memcpy(sdMBinfo->data, mbiList, mbcount * sizeof(KSM_AVMacroBlockInfo));
+            //Frame info
+            sdFrameInfo = av_frame_new_side_data(pict, KSM_AV_FRAME_INFO, sizeof(KSM_AVFrameInfo));
+            if (!sdFrameInfo) {
+                return;
+            }
+            fri->coded_picture_number = pict->coded_picture_number;
+            fri->pict_type = pict->pict_type;
+            fri->width = pict->width;
+            fri->height = pict->height;
+            memcpy(sdFrameInfo->data, fri, sizeof(KSM_AVFrameInfo));
             // */ KSM new side data.
         }
 
         av_freep(&mvs);
         av_freep(&mbiList);
+        av_freep(&fri);
     }
 
     /* TODO: export all the following to make them accessible for users (and filters) */
