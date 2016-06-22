@@ -25,6 +25,7 @@
 
 #include "libavutil/buffer.h"
 #include "libavutil/md5.h"
+#include "libavutil/motion_vector.h"
 
 #include "avcodec.h"
 #include "bswapdsp.h"
@@ -670,6 +671,10 @@ typedef struct MvField {
     int8_t ref_idx[2];
     int8_t pred_flag;
 } MvField;
+
+//typedef struct KSM_AV_HEVC_PU_Info {
+//	MvField mvf;
+//} KSM_AV_HEVC_PU_Info ;
 
 typedef struct NeighbourAvailable {
     int cand_bottom_left;

@@ -3012,11 +3012,37 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
 
     if (s->is_decoded) {
         av_log(avctx, AV_LOG_DEBUG, "Decoded frame with POC %d.\n", s->poc);
+
         s->is_decoded = 0;
     }
 
     if (s->output_frame->buf[0]) {
         av_frame_move_ref(data, s->output_frame);
+
+        //KSM add side data
+        int min_pu_width = s->ps.sps->min_pu_width;
+        int min_pu_height = s->ps.sps->min_pu_height;
+        KSM_AV_HEVC_PU_Info *puList = av_malloc_array(min_pu_width * min_pu_height, sizeof(KSM_AV_HEVC_PU_Info));
+        AVFrame *myout = data;
+        AVFrameSideData *sd_mvf = av_frame_new_side_data(myout, KSM_AV_HEVC_PU_INFO, sizeof(KSM_AV_HEVC_PU_Info) * min_pu_width * min_pu_height);
+        if (!sd_mvf) {
+            av_freep(&puList);
+            return;
+        }
+        //Fill puList
+        for (int y_pu=0; y_pu<min_pu_height; y_pu++){
+        	for (int x_pu=0; x_pu<min_pu_width; x_pu++){
+            	puList[y_pu * min_pu_width + x_pu].mvf.mv[0].x = s->ref->tab_mvf[y_pu * min_pu_width + x_pu].mv[0].x;
+            	puList[y_pu * min_pu_width + x_pu].mvf.mv[0].y = s->ref->tab_mvf[y_pu * min_pu_width + x_pu].mv[0].y;
+            	puList[y_pu * min_pu_width + x_pu].mvf.mv[1].x = s->ref->tab_mvf[y_pu * min_pu_width + x_pu].mv[1].x;
+            	puList[y_pu * min_pu_width + x_pu].mvf.mv[1].y = s->ref->tab_mvf[y_pu * min_pu_width + x_pu].mv[1].y;
+            }
+        }
+
+
+        memcpy(sd_mvf->data, puList, sizeof(KSM_AV_HEVC_PU_Info) * min_pu_width * min_pu_height);
+        av_freep(&puList);
+
         *got_output = 1;
     }
 

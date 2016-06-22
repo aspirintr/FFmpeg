@@ -612,7 +612,6 @@ AVFrameSideData *av_frame_new_side_data(AVFrame *frame,
                                         int size)
 {
     AVFrameSideData *ret, **tmp;
-
     if (frame->nb_side_data > INT_MAX / sizeof(*frame->side_data) - 1)
         return NULL;
 
@@ -639,6 +638,7 @@ AVFrameSideData *av_frame_new_side_data(AVFrame *frame,
     ret->type = type;
 
     frame->side_data[frame->nb_side_data++] = ret;
+    printf("av_frame_new_side_data size: %d type: %d add: %p\n",size,(int)type, (void*)ret);//REMOVE THIS DEBUG KSM
 
     return ret;
 }
@@ -649,8 +649,10 @@ AVFrameSideData *av_frame_get_side_data(const AVFrame *frame,
     int i;
 
     for (i = 0; i < frame->nb_side_data; i++) {
-        if (frame->side_data[i]->type == type)
+        if (frame->side_data[i]->type == type){
+            printf("av_frame_get_side_data size: %d type: %d add: %p\n",frame->side_data[i]->size,(int)frame->side_data[i]->type, (void*)frame->side_data[i]);//REMOVE THIS DEBUG KSM
             return frame->side_data[i];
+        }
     }
     return NULL;
 }

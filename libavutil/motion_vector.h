@@ -20,6 +20,7 @@
 #define AVUTIL_MOTION_VECTOR_H
 
 #include <stdint.h>
+#include "libavutil/mem.h"
 
 typedef struct AVMotionVector {
     /**
@@ -69,5 +70,20 @@ typedef struct KSM_AVFrameInfo {
 	uint32_t width;
 	uint32_t height;
 } KSM_AVFrameInfo;
+
+typedef struct KSM_Mv {
+    int16_t x;  ///< horizontal component of motion vector
+    int16_t y;  ///< vertical component of motion vector
+} KSM_Mv;
+
+typedef struct KSM_MvField {
+    DECLARE_ALIGNED(4, KSM_Mv, mv)[2];
+    int8_t ref_idx[2];
+    int8_t pred_flag;
+} KSM_MvField;
+
+typedef struct KSM_AV_HEVC_PU_Info {
+	KSM_MvField mvf;
+} KSM_AV_HEVC_PU_Info ;
 
 #endif /* AVUTIL_MOTION_VECTOR_H */
