@@ -725,6 +725,7 @@ typedef struct HEVCFrame {
     AVFrame *frame;
     ThreadFrame tf;
     MvField *tab_mvf;
+    KSM_AV_HEVC_CU_Info *tab_CU_info;
     RefPicList *refPicList;
     RefPicListTab **rpl_tab;
     int ctb_count;

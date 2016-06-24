@@ -86,4 +86,13 @@ typedef struct KSM_AV_HEVC_PU_Info {
 	KSM_MvField mvf;
 } KSM_AV_HEVC_PU_Info ;
 
+typedef struct KSM_AV_HEVC_CU_Info {
+	int pred_mode;
+	int part_mode;
+	int intra_split_flag;
+	int x;
+	int y;
+	int cb_size;
+} KSM_AV_HEVC_CU_Info ;
+
 #endif /* AVUTIL_MOTION_VECTOR_H */

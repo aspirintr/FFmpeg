@@ -102,9 +102,13 @@ enum AVFrameSideDataType {
      */
 	KSM_AV_FRAME_INFO, //KSM
     /**
-     * CTU information is exported as side data.
+     * PU information (motion vectors of HEVC) is exported as side data.
      */
 	KSM_AV_HEVC_PU_INFO, //KSM
+    /**
+     * CU information (CU size and partition type) is exported as side data.
+     */
+	KSM_AV_HEVC_CU_INFO, //KSM
     /**
      * Recommmends skipping the specified number of samples. This is exported
      * only if the "skip_manual" AVOption is set in libavcodec.

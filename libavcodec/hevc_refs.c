@@ -40,6 +40,8 @@ void ff_hevc_unref_frame(HEVCContext *s, HEVCFrame *frame, int flags)
 
         av_buffer_unref(&frame->tab_mvf_buf);
         frame->tab_mvf = NULL;
+        av_freep(&frame->tab_CU_info); //KSM
+        frame->tab_CU_info = NULL;	//KSM
 
         av_buffer_unref(&frame->rpl_buf);
         av_buffer_unref(&frame->rpl_tab_buf);
@@ -111,6 +113,7 @@ static HEVCFrame *alloc_frame(HEVCContext *s)
         frame->frame->top_field_first  = s->picture_struct == AV_PICTURE_STRUCTURE_TOP_FIELD;
         frame->frame->interlaced_frame = (s->picture_struct == AV_PICTURE_STRUCTURE_TOP_FIELD) || (s->picture_struct == AV_PICTURE_STRUCTURE_BOTTOM_FIELD);
 
+        frame->tab_CU_info = av_malloc_array(s->ps.sps->min_cb_height*s->ps.sps->min_cb_width,sizeof(KSM_AV_HEVC_CU_Info)); //KSM
         if (s->avctx->hwaccel) {
             const AVHWAccel *hwaccel = s->avctx->hwaccel;
             av_assert0(!frame->hwaccel_picture_private);

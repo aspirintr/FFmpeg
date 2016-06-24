@@ -2237,6 +2237,33 @@ static int hls_coding_quadtree(HEVCContext *s, int x0, int y0,
             return 0;
     } else {
         ret = hls_coding_unit(s, x0, y0, log2_cb_size);
+        //KSM fill CU info
+        //HEVCLocalContext *lc = s->HEVClc;
+        int length = cb_size >> s->ps.sps->log2_min_cb_size;
+        int x_cb   = x0 >> s->ps.sps->log2_min_cb_size;
+        int y_cb   = y0 >> s->ps.sps->log2_min_cb_size;
+        int x,y;
+
+        for (y = 0; y < length; y++){
+            for (x = 0; x < length; x++){
+				s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].x = lc->cu.x;
+				s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].y = lc->cu.y;
+				if (x==0 && y==0){
+					s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].pred_mode = lc->cu.pred_mode;
+					s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].part_mode = lc->cu.part_mode;
+					s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].intra_split_flag = lc->cu.intra_split_flag;
+					s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].cb_size = cb_size;
+				}
+				else{
+					s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].pred_mode = -1;
+					s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].part_mode = -1;
+					s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].intra_split_flag = -1;
+					s->ref->tab_CU_info[(y_cb + y) * s->ps.sps->min_cb_width + x_cb + x].cb_size = -1;
+
+				}
+			}
+        }//end first for
+        //KSM END
         if (ret < 0)
             return ret;
         if ((!((x0 + cb_size) %
@@ -3012,7 +3039,6 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
 
     if (s->is_decoded) {
         av_log(avctx, AV_LOG_DEBUG, "Decoded frame with POC %d.\n", s->poc);
-
         s->is_decoded = 0;
     }
 
@@ -3027,7 +3053,7 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
         AVFrameSideData *sd_mvf = av_frame_new_side_data(myout, KSM_AV_HEVC_PU_INFO, sizeof(KSM_AV_HEVC_PU_Info) * min_pu_width * min_pu_height);
         if (!sd_mvf) {
             av_freep(&puList);
-            return;
+            return ret;
         }
         //Fill puList
         for (int y_pu=0; y_pu<min_pu_height; y_pu++){
@@ -3039,9 +3065,31 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
             }
         }
 
+        //KSM add side data
+        int min_cb_width = s->ps.sps->min_cb_width;
+        int min_cb_height = s->ps.sps->min_cb_height;
+        KSM_AV_HEVC_CU_Info* cuList = av_malloc_array(min_cb_width*min_cb_height,sizeof(KSM_AV_HEVC_CU_Info));
+        //AVFrame *myout = data;
+        AVFrameSideData *sd_cui = av_frame_new_side_data(myout, KSM_AV_HEVC_CU_INFO, sizeof(KSM_AV_HEVC_CU_Info) * min_cb_width * min_cb_height);
+        if (!sd_cui) {
+            av_freep(&cuList);
+            return ret;
+        }
+        //Fill cuList
+        for (int y_cu=0; y_cu<min_cb_height; y_cu++){
+        	for (int x_cu=0; x_cu<min_cb_width; x_cu++){
+        		cuList[y_cu * min_cb_width + x_cu].pred_mode = s->ref->tab_CU_info[y_cu * min_cb_width + x_cu].pred_mode;
+        		cuList[y_cu * min_cb_width + x_cu].part_mode = s->ref->tab_CU_info[y_cu * min_cb_width + x_cu].part_mode;
+        		cuList[y_cu * min_cb_width + x_cu].intra_split_flag = s->ref->tab_CU_info[y_cu * min_cb_width + x_cu].intra_split_flag;
+        		cuList[y_cu * min_cb_width + x_cu].x = s->ref->tab_CU_info[y_cu * min_cb_width + x_cu].x;
+        		cuList[y_cu * min_cb_width + x_cu].y = s->ref->tab_CU_info[y_cu * min_cb_width + x_cu].y;
+        		cuList[y_cu * min_cb_width + x_cu].cb_size = s->ref->tab_CU_info[y_cu * min_cb_width + x_cu].cb_size;
+            }
+        }
 
-        memcpy(sd_mvf->data, puList, sizeof(KSM_AV_HEVC_PU_Info) * min_pu_width * min_pu_height);
-        av_freep(&puList);
+
+        memcpy(sd_cui->data, cuList, sizeof(KSM_AV_HEVC_CU_Info) * min_cb_width * min_cb_height);
+        av_freep(&cuList);
 
         *got_output = 1;
     }
