@@ -1580,10 +1580,11 @@ static int ksm_add_mb_info(KSM_AVMacroBlockInfo *mbi, uint32_t mb_type,
                   int direction, uint32_t mb_x, uint32_t mb_y, uint32_t mb_stride )
 {
 	add_mb(&mbi->MV, mb_type, dst_x, dst_y, motion_x, motion_y, motion_scale, direction);
+    int w = IS_8X8(mb_type) || IS_8X16(mb_type) ? 8 : 16;
+    int h = IS_8X8(mb_type) || IS_16X8(mb_type) ? 8 : 16;
 	mbi->macroblock_no = mb_x + mb_y * mb_stride;
-	mbi->mb_x = mb_x;
-	mbi->mb_y = mb_y;
-	mbi->mb_stride = mb_stride;
+	mbi->mb_x = dst_x - w/2; //Left top pixel of the MB. make it left top rather than the center.
+	mbi->mb_y = dst_y - h/2; //make it left top rather than the center.
 	mbi->mb_type = mb_type;
     return 1;
 }
@@ -1702,6 +1703,9 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
             fri->pict_type = pict->pict_type;
             fri->width = pict->width;
             fri->height = pict->height;
+            fri->min_block_size = (avctx->codec->id == AV_CODEC_ID_H264 ? 8 : 16);
+            fri->min_block_width =	(avctx->codec->id == AV_CODEC_ID_H264 ? mb_width*2 : mb_width);
+            fri->min_block_height =	(avctx->codec->id == AV_CODEC_ID_H264 ? mb_height*2 : mb_height);
             memcpy(sdFrameInfo->data, fri, sizeof(KSM_AVFrameInfo));
             // */ KSM new side data.
         }

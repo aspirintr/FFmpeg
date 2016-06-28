@@ -59,7 +59,6 @@ typedef struct KSM_AVMacroBlockInfo {
 	uint32_t macroblock_no;
 	uint32_t mb_x;
 	uint32_t mb_y;
-	uint32_t mb_stride;
 	uint32_t mb_type;
 	AVMotionVector MV;
 } KSM_AVMacroBlockInfo;
@@ -69,6 +68,19 @@ typedef struct KSM_AVFrameInfo {
 	uint32_t pict_type;
 	uint32_t width;
 	uint32_t height;
+	int min_cb_width;
+	int min_cb_height;
+	int min_tb_width;
+	int min_tb_height;
+	int min_pu_width;
+	int min_pu_height;
+	int min_cb_size;
+	int min_pu_size;
+	int min_tb_size;
+	int bit_depth;
+	int min_block_size;
+	int min_block_width;
+	int min_block_height;
 } KSM_AVFrameInfo;
 
 typedef struct KSM_Mv {

@@ -672,10 +672,6 @@ typedef struct MvField {
     int8_t pred_flag;
 } MvField;
 
-//typedef struct KSM_AV_HEVC_PU_Info {
-//	MvField mvf;
-//} KSM_AV_HEVC_PU_Info ;
-
 typedef struct NeighbourAvailable {
     int cand_bottom_left;
     int cand_left;

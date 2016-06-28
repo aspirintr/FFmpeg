@@ -3062,9 +3062,14 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
             	puList[y_pu * min_pu_width + x_pu].mvf.mv[0].y = s->ref->tab_mvf[y_pu * min_pu_width + x_pu].mv[0].y;
             	puList[y_pu * min_pu_width + x_pu].mvf.mv[1].x = s->ref->tab_mvf[y_pu * min_pu_width + x_pu].mv[1].x;
             	puList[y_pu * min_pu_width + x_pu].mvf.mv[1].y = s->ref->tab_mvf[y_pu * min_pu_width + x_pu].mv[1].y;
+            	puList[y_pu * min_pu_width + x_pu].mvf.pred_flag = s->ref->tab_mvf[y_pu * min_pu_width + x_pu].pred_flag;
+            	puList[y_pu * min_pu_width + x_pu].mvf.ref_idx[0] = s->ref->refPicList[0].list[s->ref->tab_mvf[y_pu * min_pu_width + x_pu].ref_idx[0]];
+            	puList[y_pu * min_pu_width + x_pu].mvf.ref_idx[1] = s->ref->refPicList[0].list[s->ref->tab_mvf[y_pu * min_pu_width + x_pu].ref_idx[1]];
             }
         }
 
+        memcpy(sd_mvf->data, puList, sizeof(KSM_AV_HEVC_PU_Info) * min_pu_width * min_pu_height);
+        av_freep(&puList);
         //KSM add side data
         int min_cb_width = s->ps.sps->min_cb_width;
         int min_cb_height = s->ps.sps->min_cb_height;
@@ -3090,6 +3095,32 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
 
         memcpy(sd_cui->data, cuList, sizeof(KSM_AV_HEVC_CU_Info) * min_cb_width * min_cb_height);
         av_freep(&cuList);
+
+        //Frame info
+        AVFrameSideData *sdFrameInfo = av_frame_new_side_data(myout, KSM_AV_FRAME_INFO, sizeof(KSM_AVFrameInfo));
+        if (!sdFrameInfo) {
+            return ret;
+        }
+        KSM_AVFrameInfo *fri = av_malloc_array(1, sizeof(KSM_AVFrameInfo));
+        fri->coded_picture_number = s->poc;
+        fri->pict_type = myout->pict_type;
+        fri->width = myout->width;
+        fri->height = myout->height;
+        fri->min_cb_width = min_cb_width;
+        fri->min_cb_height = min_cb_height;
+        fri->min_pu_width = s->ps.sps->min_pu_width;
+        fri->min_pu_height = s->ps.sps->min_pu_height;
+        fri->min_tb_width = s->ps.sps->min_tb_width;
+        fri->min_tb_height = s->ps.sps->min_tb_height;
+        fri->bit_depth = s->ps.sps->bit_depth;
+        fri->min_cb_size = 1 << s->ps.sps->log2_min_cb_size;
+        fri->min_pu_size = 1 << s->ps.sps->log2_min_pu_size;
+        fri->min_tb_size = 1 << s->ps.sps->log2_min_tb_size;
+        fri->min_block_width = fri->min_pu_width;
+        fri->min_block_height = fri->min_pu_height;
+        fri->min_block_size = fri->min_pu_size;
+        memcpy(sdFrameInfo->data, fri, sizeof(KSM_AVFrameInfo));
+        av_freep(&fri);
 
         *got_output = 1;
     }
