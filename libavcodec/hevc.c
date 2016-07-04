@@ -3103,6 +3103,7 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
         }
         KSM_AVFrameInfo *fri = av_malloc_array(1, sizeof(KSM_AVFrameInfo));
         fri->coded_picture_number = s->poc;
+        fri->frame_number = avctx->frame_number;
         fri->pict_type = myout->pict_type;
         fri->width = myout->width;
         fri->height = myout->height;
@@ -3122,6 +3123,20 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
         memcpy(sdFrameInfo->data, fri, sizeof(KSM_AVFrameInfo));
         av_freep(&fri);
 
+        //Video info
+        AVFrameSideData *sdVideoInfo = av_frame_new_side_data(myout, KSM_AV_VIDEO_INFO, sizeof(KSM_AVVideoInfo));
+        if (!sdVideoInfo) {
+            return ret;
+        }
+        KSM_AVVideoInfo *vid = av_malloc_array(1, sizeof(KSM_AVVideoInfo));
+        vid->codec_id = avctx->codec->id;
+        sprintf(vid->codec_name_short, "%s", avctx->codec->name);
+        sprintf(vid->codec_name_long, "%s", avctx->codec->long_name);
+        vid->gop_size = avctx->gop_size;
+        vid->aspect_ratio_num = avctx->sample_aspect_ratio.num;
+        vid->aspect_ratio_den = avctx->sample_aspect_ratio.den;
+        memcpy(sdVideoInfo->data, vid, sizeof(KSM_AVVideoInfo));
+        av_freep(&vid);
         *got_output = 1;
     }
 

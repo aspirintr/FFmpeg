@@ -55,6 +55,16 @@ typedef struct AVMotionVector {
     uint16_t motion_scale;
 } AVMotionVector;
 
+typedef struct KSM_AVVideoInfo {
+	int codec_id;
+	char codec_name_short[128];
+	char codec_name_long[1024];
+	int gop_size;
+	int aspect_ratio_num;
+	int aspect_ratio_den;
+
+} KSM_AVVideoInfo;
+
 typedef struct KSM_AVMacroBlockInfo {
 	uint32_t macroblock_no;
 	uint32_t mb_x;
@@ -65,6 +75,7 @@ typedef struct KSM_AVMacroBlockInfo {
 
 typedef struct KSM_AVFrameInfo {
 	uint32_t coded_picture_number;
+	int frame_number;
 	uint32_t pict_type;
 	uint32_t width;
 	uint32_t height;

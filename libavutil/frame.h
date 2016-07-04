@@ -98,6 +98,10 @@ enum AVFrameSideDataType {
      */
 	KSM_AV_MACROBLOCK_INFO, //KSM
     /**
+     * Video information is exported as side data.
+     */
+	KSM_AV_VIDEO_INFO, //KSM
+    /**
      * Frame information is exported as side data.
      */
 	KSM_AV_FRAME_INFO, //KSM

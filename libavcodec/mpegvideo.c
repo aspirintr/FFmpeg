@@ -1612,6 +1612,7 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
         AVMotionVector *mvs = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(AVMotionVector));
         KSM_AVMacroBlockInfo *mbiList = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(KSM_AVMacroBlockInfo));
         KSM_AVFrameInfo *fri = av_malloc_array(1, sizeof(KSM_AVFrameInfo));
+        KSM_AVVideoInfo *vid = av_malloc_array(1, sizeof(KSM_AVVideoInfo));
         //KSM_AVMacroBlockInfo *mbi = av_malloc_array(mb_width * mb_height, 2 * 4 * sizeof(KSM_AVMacroBlockInfo)); //Define KSM_AVMacroBlockInfo
         if (!mvs)
             return;
@@ -1678,6 +1679,8 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
             AVFrameSideData *sd;
             AVFrameSideData *sdMBinfo; //KSM
             AVFrameSideData *sdFrameInfo; //KSM
+            AVFrameSideData *sdVideoInfo; //KSM
+
 
             av_log(avctx, AV_LOG_DEBUG, "Adding %d MVs info to frame %d\n", mbcount, avctx->frame_number);
             sd = av_frame_new_side_data(pict, AV_FRAME_DATA_MOTION_VECTORS, mbcount * sizeof(AVMotionVector));
@@ -1706,13 +1709,28 @@ void ff_print_debug_info2(AVCodecContext *avctx, AVFrame *pict, uint8_t *mbskip_
             fri->min_block_size = (avctx->codec->id == AV_CODEC_ID_H264 ? 8 : 16);
             fri->min_block_width =	(avctx->codec->id == AV_CODEC_ID_H264 ? mb_width*2 : mb_width);
             fri->min_block_height =	(avctx->codec->id == AV_CODEC_ID_H264 ? mb_height*2 : mb_height);
+            fri->frame_number = avctx->frame_number;
             memcpy(sdFrameInfo->data, fri, sizeof(KSM_AVFrameInfo));
+            //Frame info
+            sdVideoInfo = av_frame_new_side_data(pict, KSM_AV_VIDEO_INFO, sizeof(KSM_AVVideoInfo));
+            if (!sdVideoInfo) {
+                return;
+            }
+            vid->codec_id = avctx->codec->id;
+            sprintf(vid->codec_name_short, "%s", avctx->codec->name);
+            sprintf(vid->codec_name_long, "%s", avctx->codec->long_name);
+            vid->gop_size = avctx->gop_size;
+            vid->aspect_ratio_num = avctx->sample_aspect_ratio.num;
+            vid->aspect_ratio_den = avctx->sample_aspect_ratio.den;
+            memcpy(sdVideoInfo->data, vid, sizeof(KSM_AVVideoInfo));
+
             // */ KSM new side data.
         }
 
         av_freep(&mvs);
         av_freep(&mbiList);
         av_freep(&fri);
+        av_freep(&vid);
     }
 
     /* TODO: export all the following to make them accessible for users (and filters) */
