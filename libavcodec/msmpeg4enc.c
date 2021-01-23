@@ -225,7 +225,7 @@ void ff_msmpeg4_encode_picture_header(MpegEncContext * s, int picture_number)
 {
     find_best_tables(s);
 
-    avpriv_align_put_bits(&s->pb);
+    align_put_bits(&s->pb);
     put_bits(&s->pb, 2, s->pict_type - 1);
 
     put_bits(&s->pb, 5, s->qscale);
@@ -314,11 +314,6 @@ void ff_msmpeg4_encode_motion(MpegEncContext * s,
 
     mx += 32;
     my += 32;
-#if 0
-    if ((unsigned)mx >= 64 ||
-        (unsigned)my >= 64)
-        av_log(s->avctx, AV_LOG_ERROR, "error mx=%d my=%d\n", mx, my);
-#endif
     mv = &ff_mv_tables[s->mv_table_index];
 
     code = mv->table_mv_index[(mx << 6) | my];

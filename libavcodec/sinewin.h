@@ -22,7 +22,7 @@
 #define AVCODEC_SINEWIN_H
 
 #include "config.h"
-#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 #include "libavcodec/aac_defines.h"
 
 #if CONFIG_HARDCODED_TABLES
@@ -60,6 +60,6 @@ extern SINETABLE(2048);
 extern SINETABLE(4096);
 extern SINETABLE(8192);
 
-extern SINETABLE_CONST INTFLOAT * const AAC_RENAME(ff_sine_windows)[14];
+extern SINETABLE_CONST INTFLOAT * const AAC_RENAME(ff_sine_windows)[];
 
 #endif /* AVCODEC_SINEWIN_H */

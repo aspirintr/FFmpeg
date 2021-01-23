@@ -53,7 +53,7 @@ static av_cold int encode_init(AVCodecContext *avctx)
     if (avctx->bit_rate < 24 * 1000) {
         av_log(avctx, AV_LOG_ERROR,
                "bitrate too low: got %"PRId64", need 24000 or higher\n",
-               (int64_t)avctx->bit_rate);
+               avctx->bit_rate);
         return AVERROR(EINVAL);
     }
 
@@ -343,7 +343,7 @@ static int encode_block(WMACodecContext *s, float (*src_coefs)[BLOCK_MAX_SIZE],
                          s->coef_vlcs[tindex]->huffcodes[1]);
         }
         if (s->version == 1 && s->avctx->channels >= 2)
-            avpriv_align_put_bits(&s->pb);
+            align_put_bits(&s->pb);
     }
     return 0;
 }
@@ -358,7 +358,7 @@ static int encode_frame(WMACodecContext *s, float (*src_coefs)[BLOCK_MAX_SIZE],
     else if (encode_block(s, src_coefs, total_gain) < 0)
         return INT_MAX;
 
-    avpriv_align_put_bits(&s->pb);
+    align_put_bits(&s->pb);
 
     return put_bits_count(&s->pb) / 8 - s->avctx->block_align;
 }

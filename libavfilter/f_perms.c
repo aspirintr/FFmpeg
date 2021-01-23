@@ -33,7 +33,7 @@ enum mode {
     NB_MODES
 };
 
-typedef struct {
+typedef struct PermsContext {
     const AVClass *class;
     AVLFG lfg;
     int64_t random_seed;
@@ -64,7 +64,7 @@ static av_cold int init(AVFilterContext *ctx)
         if (s->random_seed == -1)
             s->random_seed = av_get_random_seed();
         seed = s->random_seed;
-        av_log(ctx, AV_LOG_INFO, "random seed: 0x%08x\n", seed);
+        av_log(ctx, AV_LOG_INFO, "random seed: 0x%08"PRIx32"\n", seed);
         av_lfg_init(&s->lfg, seed);
     }
 
@@ -141,6 +141,7 @@ AVFilter ff_af_aperms = {
     .inputs      = aperms_inputs,
     .outputs     = aperms_outputs,
     .priv_class  = &aperms_class,
+    .flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
 };
 #endif /* CONFIG_APERMS_FILTER */
 
@@ -174,5 +175,6 @@ AVFilter ff_vf_perms = {
     .inputs      = perms_inputs,
     .outputs     = perms_outputs,
     .priv_class  = &perms_class,
+    .flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
 };
 #endif /* CONFIG_PERMS_FILTER */

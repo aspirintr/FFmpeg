@@ -75,7 +75,6 @@ static av_cold int h261_decode_init(AVCodecContext *avctx)
     MpegEncContext *const s = &h->s;
 
     // set defaults
-    ff_mpv_decode_defaults(s);
     ff_mpv_decode_init(s, avctx);
 
     s->out_format  = FMT_H261;
@@ -223,7 +222,7 @@ static int h261_decode_mb_skipped(H261Context *h, int mba1, int mba2)
             s->current_picture.motion_val[0][b_xy][1] = s->mv[0][0][1];
         }
 
-        ff_mpv_decode_mb(s, s->block);
+        ff_mpv_reconstruct_mb(s, s->block);
     }
 
     return 0;
@@ -431,7 +430,7 @@ static int h261_decode_mb(H261Context *h)
 
     // Read cbp
     if (HAS_CBP(h->mtype))
-        cbp = get_vlc2(&s->gb, h261_cbp_vlc.table, H261_CBP_VLC_BITS, 2) + 1;
+        cbp = get_vlc2(&s->gb, h261_cbp_vlc.table, H261_CBP_VLC_BITS, 1) + 1;
 
     if (s->mb_intra) {
         s->current_picture.mb_type[xy] = MB_TYPE_INTRA;
@@ -466,7 +465,7 @@ intra:
             s->block_last_index[i] = -1;
     }
 
-    ff_mpv_decode_mb(s, s->block);
+    ff_mpv_reconstruct_mb(s, s->block);
 
     return SLICE_OK;
 }
@@ -686,5 +685,6 @@ AVCodec ff_h261_decoder = {
     .close          = h261_decode_end,
     .decode         = h261_decode_frame,
     .capabilities   = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .max_lowres     = 3,
 };

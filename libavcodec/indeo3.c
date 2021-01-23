@@ -66,7 +66,7 @@ typedef struct Plane {
     uint8_t         *pixels[2]; ///< pointer to the actual pixel data of the buffers above
     uint32_t        width;
     uint32_t        height;
-    uint32_t        pitch;
+    ptrdiff_t       pitch;
 } Plane;
 
 #define CELL_STACK_MAX  20
@@ -166,7 +166,8 @@ static av_cold int allocate_frame_buffers(Indeo3DecodeContext *ctx,
                                           AVCodecContext *avctx, int luma_width, int luma_height)
 {
     int p, chroma_width, chroma_height;
-    int luma_pitch, chroma_pitch, luma_size, chroma_size;
+    int luma_size, chroma_size;
+    ptrdiff_t luma_pitch, chroma_pitch;
 
     if (luma_width  < 16 || luma_width  > 640 ||
         luma_height < 16 || luma_height > 480 ||
@@ -202,10 +203,8 @@ static av_cold int allocate_frame_buffers(Indeo3DecodeContext *ctx,
         ctx->planes[p].buffers[0] = av_malloc(!p ? luma_size : chroma_size);
         ctx->planes[p].buffers[1] = av_malloc(!p ? luma_size : chroma_size);
 
-        if (!ctx->planes[p].buffers[0] || !ctx->planes[p].buffers[1]) {
-            free_frame_buffers(ctx);
+        if (!ctx->planes[p].buffers[0] || !ctx->planes[p].buffers[1])
             return AVERROR(ENOMEM);
-        }
 
         /* fill the INTRA prediction lines with the middle pixel value = 64 */
         memset(ctx->planes[p].buffers[0], 0x40, ctx->planes[p].pitch);
@@ -425,7 +424,7 @@ if (*data_ptr >= last_ptr) \
 
 static int decode_cell_data(Indeo3DecodeContext *ctx, Cell *cell,
                             uint8_t *block, uint8_t *ref_block,
-                            int pitch, int h_zoom, int v_zoom, int mode,
+                            ptrdiff_t row_offset, int h_zoom, int v_zoom, int mode,
                             const vqEntry *delta[2], int swap_quads[2],
                             const uint8_t **data_ptr, const uint8_t *last_ptr)
 {
@@ -436,9 +435,8 @@ static int decode_cell_data(Indeo3DecodeContext *ctx, Cell *cell,
     unsigned int  dyad1, dyad2;
     uint64_t      pix64;
     int           skip_flag = 0, is_top_of_cell, is_first_row = 1;
-    int           row_offset, blk_row_offset, line_offset;
+    int           blk_row_offset, line_offset;
 
-    row_offset     =  pitch;
     blk_row_offset = (row_offset << (2 + v_zoom)) - (cell->width << 2);
     line_offset    = v_zoom ? row_offset : 0;
 
@@ -1025,11 +1023,11 @@ static int decode_frame_headers(Indeo3DecodeContext *ctx, AVCodecContext *avctx,
  *  @param[in]  dst_height   output plane height
  */
 static void output_plane(const Plane *plane, int buf_sel, uint8_t *dst,
-                         int dst_pitch, int dst_height)
+                         ptrdiff_t dst_pitch, int dst_height)
 {
     int             x,y;
     const uint8_t   *src  = plane->pixels[buf_sel];
-    uint32_t        pitch = plane->pitch;
+    ptrdiff_t       pitch = plane->pitch;
 
     dst_height = FFMIN(dst_height, plane->height);
     for (y = 0; y < dst_height; y++) {
@@ -1143,4 +1141,5 @@ AVCodec ff_indeo3_decoder = {
     .close          = decode_close,
     .decode         = decode_frame,
     .capabilities   = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

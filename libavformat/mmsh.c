@@ -65,8 +65,7 @@ static int mmsh_close(URLContext *h)
 {
     MMSHContext *mmsh = (MMSHContext *)h->priv_data;
     MMSContext *mms   = &mmsh->mms;
-    if (mms->mms_hd)
-        ffurl_closep(&mms->mms_hd);
+    ffurl_closep(&mms->mms_hd);
     av_freep(&mms->streams);
     av_freep(&mms->asf_header);
     return 0;
@@ -246,6 +245,14 @@ static int mmsh_open_internal(URLContext *h, const char *uri, int flags, int tim
              host, port, mmsh->request_seq++);
     av_opt_set(mms->mms_hd->priv_data, "headers", headers, 0);
 
+    if (!mms->mms_hd->protocol_whitelist && h->protocol_whitelist) {
+        mms->mms_hd->protocol_whitelist = av_strdup(h->protocol_whitelist);
+        if (!mms->mms_hd->protocol_whitelist) {
+            err = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
+
     err = ffurl_connect(mms->mms_hd, NULL);
     if (err) {
         goto fail;
@@ -257,7 +264,7 @@ static int mmsh_open_internal(URLContext *h, const char *uri, int flags, int tim
     }
 
     // close the socket and then reopen it for sending the second play request.
-    ffurl_close(mms->mms_hd);
+    ffurl_closep(&mms->mms_hd);
     memset(headers, 0, sizeof(headers));
     if ((err = ffurl_alloc(&mms->mms_hd, httpname, AVIO_FLAG_READ,
                            &h->interrupt_callback)) < 0) {
@@ -410,4 +417,5 @@ const URLProtocol ff_mmsh_protocol = {
     .url_read_seek  = mmsh_read_seek,
     .priv_data_size = sizeof(MMSHContext),
     .flags          = URL_PROTOCOL_FLAG_NETWORK,
+    .default_whitelist = "http,tcp",
 };

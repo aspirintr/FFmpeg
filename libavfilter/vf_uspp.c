@@ -29,15 +29,17 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "internal.h"
+#include "qp_table.h"
 #include "avfilter.h"
 
 #define MAX_LEVEL 8 /* quality levels */
 #define BLOCK 16
 
-typedef struct {
+typedef struct USPPContext {
     const AVClass *av_class;
     int log2_count;
     int hsub, vsub;
@@ -51,8 +53,8 @@ typedef struct {
     AVCodecContext *avctx_enc[BLOCK*BLOCK];
     AVFrame *frame;
     AVFrame *frame_dec;
-    uint8_t *non_b_qp_table;
-    int non_b_qp_alloc_size;
+    int8_t *non_b_qp_table;
+    int non_b_qp_stride;
     int use_bframe_qp;
 } USPPContext;
 
@@ -186,6 +188,7 @@ static void filter(USPPContext *p, uint8_t *dst[3], uint8_t *src[3],
 {
     int x, y, i, j;
     const int count = 1<<p->log2_count;
+    int ret;
 
     for (i = 0; i < 3; i++) {
         int is_chroma = !!i;
@@ -227,8 +230,8 @@ static void filter(USPPContext *p, uint8_t *dst[3], uint8_t *src[3],
         p->frame->quality = ff_norm_qscale((qpsum + qpcount/2) / qpcount, p->qscale_type) * FF_QP2LAMBDA;
     }
 //    init per MB qscale stuff FIXME
-    p->frame->height = height;
-    p->frame->width  = width;
+    p->frame->height = height + BLOCK;
+    p->frame->width  = width + BLOCK;
 
     for (i = 0; i < count; i++) {
         const int x1 = offset[i+count-1][0];
@@ -249,7 +252,12 @@ static void filter(USPPContext *p, uint8_t *dst[3], uint8_t *src[3],
         p->frame->data[2] = p->src[2] + x1c  + y1c  * p->frame->linesize[2];
         p->frame->format  = p->avctx_enc[i]->pix_fmt;
 
-        avcodec_encode_video2(p->avctx_enc[i], &pkt, p->frame, &got_pkt_ptr);
+        ret = avcodec_encode_video2(p->avctx_enc[i], &pkt, p->frame, &got_pkt_ptr);
+        if (ret < 0) {
+            av_log(p->avctx_enc[i], AV_LOG_ERROR, "Encoding failed\n");
+            continue;
+        }
+
         p->frame_dec = p->avctx_enc[i]->coded_frame;
 
         offset = (BLOCK-x1) + (BLOCK-y1) * p->frame_dec->linesize[0];
@@ -310,7 +318,7 @@ static int config_input(AVFilterLink *inlink)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     int i;
 
-    AVCodec *enc = avcodec_find_encoder(AV_CODEC_ID_SNOW);
+    const AVCodec *enc = avcodec_find_encoder(AV_CODEC_ID_SNOW);
     if (!enc) {
         av_log(ctx, AV_LOG_ERROR, "SNOW encoder not found.\n");
         return AVERROR(EINVAL);
@@ -351,14 +359,14 @@ static int config_input(AVFilterLink *inlink)
         avctx_enc->gop_size = INT_MAX;
         avctx_enc->max_b_frames = 0;
         avctx_enc->pix_fmt = inlink->format;
-        avctx_enc->flags = AV_CODEC_FLAG_QSCALE | CODEC_FLAG_LOW_DELAY;
+        avctx_enc->flags = AV_CODEC_FLAG_QSCALE | AV_CODEC_FLAG_LOW_DELAY;
         avctx_enc->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
         avctx_enc->global_quality = 123;
         av_dict_set(&opts, "no_bitstream", "1", 0);
         ret = avcodec_open2(avctx_enc, enc, &opts);
+        av_dict_free(&opts);
         if (ret < 0)
             return ret;
-        av_dict_free(&opts);
         av_assert0(avctx_enc->codec);
     }
 
@@ -379,45 +387,32 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out = in;
 
     int qp_stride = 0;
-    uint8_t *qp_table = NULL;
+    int8_t *qp_table = NULL;
+    int ret = 0;
 
     /* if we are not in a constant user quantizer mode and we don't want to use
      * the quantizers from the B-frames (B-frames often have a higher QP), we
      * need to save the qp table from the last non B-frame; this is what the
      * following code block does */
-    if (!uspp->qp) {
-        qp_table = av_frame_get_qp_table(in, &qp_stride, &uspp->qscale_type);
+    if (!uspp->qp && (uspp->use_bframe_qp || in->pict_type != AV_PICTURE_TYPE_B)) {
+        ret = ff_qp_table_extract(in, &qp_table, &qp_stride, NULL, &uspp->qscale_type);
+        if (ret < 0) {
+            av_frame_free(&in);
+            return ret;
+        }
 
-        if (qp_table && !uspp->use_bframe_qp && in->pict_type != AV_PICTURE_TYPE_B) {
-            int w, h;
-
-            /* if the qp stride is not set, it means the QP are only defined on
-             * a line basis */
-            if (!qp_stride) {
-                w = AV_CEIL_RSHIFT(inlink->w, 4);
-                h = 1;
-            } else {
-                w = qp_stride;
-                h = AV_CEIL_RSHIFT(inlink->h, 4);
-            }
-
-            if (w * h > uspp->non_b_qp_alloc_size) {
-                int ret = av_reallocp_array(&uspp->non_b_qp_table, w, h);
-                if (ret < 0) {
-                    uspp->non_b_qp_alloc_size = 0;
-                    return ret;
-                }
-                uspp->non_b_qp_alloc_size = w * h;
-            }
-
-            av_assert0(w * h <= uspp->non_b_qp_alloc_size);
-            memcpy(uspp->non_b_qp_table, qp_table, w * h);
+        if (!uspp->use_bframe_qp && in->pict_type != AV_PICTURE_TYPE_B) {
+            av_freep(&uspp->non_b_qp_table);
+            uspp->non_b_qp_table  = qp_table;
+            uspp->non_b_qp_stride = qp_stride;
         }
     }
 
     if (uspp->log2_count && !ctx->is_disabled) {
-        if (!uspp->use_bframe_qp && uspp->non_b_qp_table)
+        if (!uspp->use_bframe_qp && uspp->non_b_qp_table) {
             qp_table = uspp->non_b_qp_table;
+            qp_stride = uspp->non_b_qp_stride;
+        }
 
         if (qp_table || uspp->qp) {
 
@@ -449,7 +444,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                                 inlink->w, inlink->h);
         av_frame_free(&in);
     }
-    return ff_filter_frame(outlink, out);
+    ret = ff_filter_frame(outlink, out);
+    if (qp_table != uspp->non_b_qp_table)
+        av_freep(&qp_table);
+    return ret;
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
@@ -462,10 +460,8 @@ static av_cold void uninit(AVFilterContext *ctx)
         av_freep(&uspp->src[i]);
     }
 
-    for (i = 0; i < (1 << uspp->log2_count); i++) {
-        avcodec_close(uspp->avctx_enc[i]);
-        av_freep(&uspp->avctx_enc[i]);
-    }
+    for (i = 0; i < (1 << uspp->log2_count); i++)
+        avcodec_free_context(&uspp->avctx_enc[i]);
 
     av_freep(&uspp->non_b_qp_table);
     av_freep(&uspp->outbuf);

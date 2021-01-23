@@ -19,7 +19,6 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <stdarg.h>
 #include <stdint.h>
 
 #include "config.h"
@@ -31,29 +30,29 @@
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
-#include "libavutil/pixdesc.h"
+#include "libavutil/pixfmt.h"
+#include "libavutil/thread.h"
 #include "libavutil/time.h"
-#include "libavutil/time_internal.h"
 #include "libavutil/timestamp.h"
 
 #include "libavcodec/bytestream.h"
 #include "libavcodec/internal.h"
+#include "libavcodec/packet_internal.h"
 #include "libavcodec/raw.h"
 
-#include "audiointerleave.h"
 #include "avformat.h"
 #include "avio_internal.h"
 #include "id3v2.h"
 #include "internal.h"
-#include "metadata.h"
 #if CONFIG_NETWORK
 #include "network.h"
 #endif
-#include "riff.h"
 #include "url.h"
 
 #include "libavutil/ffversion.h"
 const char av_format_ffversion[] = "FFmpeg version " FFMPEG_VERSION;
+
+static AVMutex avformat_mutex = AV_MUTEX_INITIALIZER;
 
 /**
  * @file
@@ -74,7 +73,17 @@ const char *avformat_configuration(void)
 const char *avformat_license(void)
 {
 #define LICENSE_PREFIX "libavformat license: "
-    return LICENSE_PREFIX FFMPEG_LICENSE + sizeof(LICENSE_PREFIX) - 1;
+    return &LICENSE_PREFIX FFMPEG_LICENSE[sizeof(LICENSE_PREFIX) - 1];
+}
+
+int ff_lock_avformat(void)
+{
+    return ff_mutex_lock(&avformat_mutex) ? -1 : 0;
+}
+
+int ff_unlock_avformat(void)
+{
+    return ff_mutex_unlock(&avformat_mutex) ? -1 : 0;
 }
 
 #define RELATIVE_TS_BASE (INT64_MAX - (1LL<<48))
@@ -90,22 +99,27 @@ static int is_relative(int64_t ts) {
  * @param timestamp the time stamp to wrap
  * @return resulting time stamp
  */
-static int64_t wrap_timestamp(AVStream *st, int64_t timestamp)
+static int64_t wrap_timestamp(const AVStream *st, int64_t timestamp)
 {
-    if (st->pts_wrap_behavior != AV_PTS_WRAP_IGNORE &&
-        st->pts_wrap_reference != AV_NOPTS_VALUE && timestamp != AV_NOPTS_VALUE) {
-        if (st->pts_wrap_behavior == AV_PTS_WRAP_ADD_OFFSET &&
-            timestamp < st->pts_wrap_reference)
+    if (st->internal->pts_wrap_behavior != AV_PTS_WRAP_IGNORE && st->pts_wrap_bits < 64 &&
+        st->internal->pts_wrap_reference != AV_NOPTS_VALUE && timestamp != AV_NOPTS_VALUE) {
+        if (st->internal->pts_wrap_behavior == AV_PTS_WRAP_ADD_OFFSET &&
+            timestamp < st->internal->pts_wrap_reference)
             return timestamp + (1ULL << st->pts_wrap_bits);
-        else if (st->pts_wrap_behavior == AV_PTS_WRAP_SUB_OFFSET &&
-            timestamp >= st->pts_wrap_reference)
+        else if (st->internal->pts_wrap_behavior == AV_PTS_WRAP_SUB_OFFSET &&
+            timestamp >= st->internal->pts_wrap_reference)
             return timestamp - (1ULL << st->pts_wrap_bits);
     }
     return timestamp;
 }
 
+#if FF_API_FORMAT_GET_SET
 MAKE_ACCESSORS(AVStream, stream, AVRational, r_frame_rate)
+#if FF_API_LAVF_FFSERVER
+FF_DISABLE_DEPRECATION_WARNINGS
 MAKE_ACCESSORS(AVStream, stream, char *, recommended_encoder_configuration)
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
 MAKE_ACCESSORS(AVFormatContext, format, AVCodec *, video_codec)
 MAKE_ACCESSORS(AVFormatContext, format, AVCodec *, audio_codec)
 MAKE_ACCESSORS(AVFormatContext, format, AVCodec *, subtitle_codec)
@@ -118,11 +132,12 @@ FF_DISABLE_DEPRECATION_WARNINGS
 MAKE_ACCESSORS(AVFormatContext, format, AVOpenCallback, open_cb)
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
+#endif
 
 int64_t av_stream_get_end_pts(const AVStream *st)
 {
-    if (st->priv_pts) {
-        return st->priv_pts->val;
+    if (st->internal->priv_pts) {
+        return st->internal->priv_pts->val;
     } else
         return AV_NOPTS_VALUE;
 }
@@ -138,11 +153,11 @@ void av_format_inject_global_side_data(AVFormatContext *s)
     s->internal->inject_global_side_data = 1;
     for (i = 0; i < s->nb_streams; i++) {
         AVStream *st = s->streams[i];
-        st->inject_global_side_data = 1;
+        st->internal->inject_global_side_data = 1;
     }
 }
 
-int ff_copy_whiteblacklists(AVFormatContext *dst, AVFormatContext *src)
+int ff_copy_whiteblacklists(AVFormatContext *dst, const AVFormatContext *src)
 {
     av_assert0(!dst->codec_whitelist &&
                !dst->format_whitelist &&
@@ -162,7 +177,7 @@ int ff_copy_whiteblacklists(AVFormatContext *dst, AVFormatContext *src)
     return 0;
 }
 
-static const AVCodec *find_decoder(AVFormatContext *s, AVStream *st, enum AVCodecID codec_id)
+static const AVCodec *find_decoder(AVFormatContext *s, const AVStream *st, enum AVCodecID codec_id)
 {
 #if FF_API_LAVF_AVCTX
 FF_DISABLE_DEPRECATION_WARNINGS
@@ -186,10 +201,42 @@ FF_ENABLE_DEPRECATION_WARNINGS
     return avcodec_find_decoder(codec_id);
 }
 
+static const AVCodec *find_probe_decoder(AVFormatContext *s, const AVStream *st, enum AVCodecID codec_id)
+{
+    const AVCodec *codec;
+
+#if CONFIG_H264_DECODER
+    /* Other parts of the code assume this decoder to be used for h264,
+     * so force it if possible. */
+    if (codec_id == AV_CODEC_ID_H264)
+        return avcodec_find_decoder_by_name("h264");
+#endif
+
+    codec = find_decoder(s, st, codec_id);
+    if (!codec)
+        return NULL;
+
+    if (codec->capabilities & AV_CODEC_CAP_AVOID_PROBING) {
+        const AVCodec *probe_codec = NULL;
+        void *iter = NULL;
+        while ((probe_codec = av_codec_iterate(&iter))) {
+            if (probe_codec->id == codec->id &&
+                    av_codec_is_decoder(probe_codec) &&
+                    !(probe_codec->capabilities & (AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_EXPERIMENTAL))) {
+                return probe_codec;
+            }
+        }
+    }
+
+    return codec;
+}
+
+#if FF_API_FORMAT_GET_SET
 int av_format_get_probe_score(const AVFormatContext *s)
 {
     return s->probe_score;
 }
+#endif
 
 /* an arbitrarily chosen "sane" max packet size -- 50M */
 #define SANE_CHUNK_SIZE (50000000)
@@ -197,18 +244,23 @@ int av_format_get_probe_score(const AVFormatContext *s)
 int ffio_limit(AVIOContext *s, int size)
 {
     if (s->maxsize>= 0) {
-        int64_t remaining= s->maxsize - avio_tell(s);
+        int64_t pos = avio_tell(s);
+        int64_t remaining= s->maxsize - pos;
         if (remaining < size) {
             int64_t newsize = avio_size(s);
             if (!s->maxsize || s->maxsize<newsize)
                 s->maxsize = newsize - !newsize;
-            remaining= s->maxsize - avio_tell(s);
-            remaining= FFMAX(remaining, 0);
+            if (pos > s->maxsize && s->maxsize >= 0)
+                s->maxsize = AVERROR(EIO);
+            if (s->maxsize >= 0)
+                remaining = s->maxsize - pos;
         }
 
-        if (s->maxsize>= 0 && remaining+1 < size) {
-            av_log(NULL, remaining ? AV_LOG_ERROR : AV_LOG_DEBUG, "Truncating packet of size %d to %"PRId64"\n", size, remaining+1);
-            size = remaining+1;
+        if (s->maxsize >= 0 && remaining < size && size > 1) {
+            av_log(NULL, remaining ? AV_LOG_ERROR : AV_LOG_DEBUG,
+                   "Truncating packet of size %d to %"PRId64"\n",
+                   size, remaining + !remaining);
+            size = remaining + !remaining;
         }
     }
     return size;
@@ -218,7 +270,6 @@ int ffio_limit(AVIOContext *s, int size)
  * Return the number of bytes read or an error. */
 static int append_packet_chunked(AVIOContext *s, AVPacket *pkt, int size)
 {
-    int64_t orig_pos   = pkt->pos; // av_grow_packet might reset pos
     int orig_size      = pkt->size;
     int ret;
 
@@ -251,7 +302,6 @@ static int append_packet_chunked(AVIOContext *s, AVPacket *pkt, int size)
     if (size > 0)
         pkt->flags |= AV_PKT_FLAG_CORRUPT;
 
-    pkt->pos = orig_pos;
     if (!pkt->size)
         av_packet_unref(pkt);
     return pkt->size > orig_size ? pkt->size - orig_size : ret;
@@ -291,6 +341,7 @@ static int set_codec_from_probe_data(AVFormatContext *s, AVStream *st,
     } fmt_id_type[] = {
         { "aac",       AV_CODEC_ID_AAC,        AVMEDIA_TYPE_AUDIO },
         { "ac3",       AV_CODEC_ID_AC3,        AVMEDIA_TYPE_AUDIO },
+        { "aptx",      AV_CODEC_ID_APTX,       AVMEDIA_TYPE_AUDIO },
         { "dts",       AV_CODEC_ID_DTS,        AVMEDIA_TYPE_AUDIO },
         { "dvbsub",    AV_CODEC_ID_DVB_SUBTITLE,AVMEDIA_TYPE_SUBTITLE },
         { "dvbtxt",    AV_CODEC_ID_DVB_TELETEXT,AVMEDIA_TYPE_SUBTITLE },
@@ -299,24 +350,28 @@ static int set_codec_from_probe_data(AVFormatContext *s, AVStream *st,
         { "hevc",      AV_CODEC_ID_HEVC,       AVMEDIA_TYPE_VIDEO },
         { "loas",      AV_CODEC_ID_AAC_LATM,   AVMEDIA_TYPE_AUDIO },
         { "m4v",       AV_CODEC_ID_MPEG4,      AVMEDIA_TYPE_VIDEO },
+        { "mjpeg_2000",AV_CODEC_ID_JPEG2000,   AVMEDIA_TYPE_VIDEO },
         { "mp3",       AV_CODEC_ID_MP3,        AVMEDIA_TYPE_AUDIO },
         { "mpegvideo", AV_CODEC_ID_MPEG2VIDEO, AVMEDIA_TYPE_VIDEO },
         { "truehd",    AV_CODEC_ID_TRUEHD,     AVMEDIA_TYPE_AUDIO },
         { 0 }
     };
     int score;
-    AVInputFormat *fmt = av_probe_input_format3(pd, 1, &score);
+    const AVInputFormat *fmt = av_probe_input_format3(pd, 1, &score);
 
-    if (fmt && st->request_probe <= score) {
+    if (fmt) {
         int i;
         av_log(s, AV_LOG_DEBUG,
                "Probe with size=%d, packets=%d detected %s with score=%d\n",
-               pd->buf_size, MAX_PROBE_PACKETS - st->probe_packets,
+               pd->buf_size, s->max_probe_packets - st->probe_packets,
                fmt->name, score);
         for (i = 0; fmt_id_type[i].name; i++) {
             if (!strcmp(fmt->name, fmt_id_type[i].name)) {
                 if (fmt_id_type[i].type != AVMEDIA_TYPE_AUDIO &&
                     st->codecpar->sample_rate)
+                    continue;
+                if (st->internal->request_probe > score &&
+                    st->codecpar->codec_id != fmt_id_type[i].id)
                     continue;
                 st->codecpar->codec_id   = fmt_id_type[i].id;
                 st->codecpar->codec_type = fmt_id_type[i].type;
@@ -389,34 +444,6 @@ static int init_input(AVFormatContext *s, const char *filename,
                                  s, 0, s->format_probesize);
 }
 
-static int add_to_pktbuf(AVPacketList **packet_buffer, AVPacket *pkt,
-                         AVPacketList **plast_pktl, int ref)
-{
-    AVPacketList *pktl = av_mallocz(sizeof(AVPacketList));
-    int ret;
-
-    if (!pktl)
-        return AVERROR(ENOMEM);
-
-    if (ref) {
-        if ((ret = av_packet_ref(&pktl->pkt, pkt)) < 0) {
-            av_free(pktl);
-            return ret;
-        }
-    } else {
-        pktl->pkt = *pkt;
-    }
-
-    if (*packet_buffer)
-        (*plast_pktl)->next = pktl;
-    else
-        *packet_buffer = pktl;
-
-    /* Add the packet in the buffered packet list. */
-    *plast_pktl = pktl;
-    return 0;
-}
-
 int avformat_queue_attached_pictures(AVFormatContext *s)
 {
     int i, ret;
@@ -430,9 +457,10 @@ int avformat_queue_attached_pictures(AVFormatContext *s)
                 continue;
             }
 
-            ret = add_to_pktbuf(&s->internal->raw_packet_buffer,
-                                &s->streams[i]->attached_pic,
-                                &s->internal->raw_packet_buffer_end, 1);
+            ret = avpriv_packet_list_put(&s->internal->raw_packet_buffer,
+                                     &s->internal->raw_packet_buffer_end,
+                                     &s->streams[i]->attached_pic,
+                                     av_packet_ref, 0);
             if (ret < 0)
                 return ret;
         }
@@ -447,6 +475,12 @@ static int update_stream_avctx(AVFormatContext *s)
 
         if (!st->internal->need_context_update)
             continue;
+
+        /* close parser, because it depends on the codec */
+        if (st->parser && st->internal->avctx->codec_id != st->codecpar->codec_id) {
+            av_parser_close(st->parser);
+            st->parser = NULL;
+        }
 
         /* update internal codec context, for the parser */
         ret = avcodec_parameters_to_context(st->internal->avctx, st->codecpar);
@@ -469,7 +503,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
 
 int avformat_open_input(AVFormatContext **ps, const char *filename,
-                        AVInputFormat *fmt, AVDictionary **options)
+                        ff_const59 AVInputFormat *fmt, AVDictionary **options)
 {
     AVFormatContext *s = *ps;
     int i, ret = 0;
@@ -494,6 +528,16 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     if ((ret = av_opt_set_dict(s, &tmp)) < 0)
         goto fail;
 
+    if (!(s->url = av_strdup(filename ? filename : ""))) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+#if FF_API_FORMAT_FILENAME
+FF_DISABLE_DEPRECATION_WARNINGS
+    av_strlcpy(s->filename, filename ? filename : "", sizeof(s->filename));
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
     if ((ret = init_input(s, filename, &tmp)) < 0)
         goto fail;
     s->probe_score = ret;
@@ -531,7 +575,6 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     }
 
     s->duration = s->start_time = AV_NOPTS_VALUE;
-    av_strlcpy(s->filename, filename ? filename : "", sizeof(s->filename));
 
     /* Allocate private data. */
     if (s->iformat->priv_data_size > 0) {
@@ -549,24 +592,37 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
 
     /* e.g. AVFMT_NOFILE formats will not have a AVIOContext */
     if (s->pb)
-        ff_id3v2_read(s, ID3v2_DEFAULT_MAGIC, &id3v2_extra_meta, 0);
+        ff_id3v2_read_dict(s->pb, &s->internal->id3v2_meta, ID3v2_DEFAULT_MAGIC, &id3v2_extra_meta);
+
 
     if (!(s->flags&AVFMT_FLAG_PRIV_OPT) && s->iformat->read_header)
         if ((ret = s->iformat->read_header(s)) < 0)
             goto fail;
 
+    if (!s->metadata) {
+        s->metadata = s->internal->id3v2_meta;
+        s->internal->id3v2_meta = NULL;
+    } else if (s->internal->id3v2_meta) {
+        av_log(s, AV_LOG_WARNING, "Discarding ID3 tags because more suitable tags were found.\n");
+        av_dict_free(&s->internal->id3v2_meta);
+    }
+
     if (id3v2_extra_meta) {
         if (!strcmp(s->iformat->name, "mp3") || !strcmp(s->iformat->name, "aac") ||
-            !strcmp(s->iformat->name, "tta")) {
-            if ((ret = ff_id3v2_parse_apic(s, &id3v2_extra_meta)) < 0)
-                goto fail;
+            !strcmp(s->iformat->name, "tta") || !strcmp(s->iformat->name, "wav")) {
+            if ((ret = ff_id3v2_parse_apic(s, id3v2_extra_meta)) < 0)
+                goto close;
+            if ((ret = ff_id3v2_parse_chapters(s, id3v2_extra_meta)) < 0)
+                goto close;
+            if ((ret = ff_id3v2_parse_priv(s, id3v2_extra_meta)) < 0)
+                goto close;
         } else
             av_log(s, AV_LOG_DEBUG, "demuxer does not support additional id3 data, skipping\n");
     }
     ff_id3v2_free_extra_meta(&id3v2_extra_meta);
 
     if ((ret = avformat_queue_attached_pictures(s)) < 0)
-        goto fail;
+        goto close;
 
     if (!(s->flags&AVFMT_FLAG_PRIV_OPT) && s->pb && !s->internal->data_offset)
         s->internal->data_offset = avio_tell(s->pb);
@@ -585,6 +641,9 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     *ps = s;
     return 0;
 
+close:
+    if (s->iformat->read_close)
+        s->iformat->read_close(s);
 fail:
     ff_id3v2_free_extra_meta(&id3v2_extra_meta);
     av_dict_free(&tmp);
@@ -612,13 +671,17 @@ static void force_codec_ids(AVFormatContext *s, AVStream *st)
         if (s->subtitle_codec_id)
             st->codecpar->codec_id = s->subtitle_codec_id;
         break;
+    case AVMEDIA_TYPE_DATA:
+        if (s->data_codec_id)
+            st->codecpar->codec_id = s->data_codec_id;
+        break;
     }
 }
 
 static int probe_codec(AVFormatContext *s, AVStream *st, const AVPacket *pkt)
 {
-    if (st->request_probe>0) {
-        AVProbeData *pd = &st->probe_data;
+    if (st->internal->request_probe>0) {
+        AVProbeData *pd = &st->internal->probe_data;
         int end;
         av_log(s, AV_LOG_DEBUG, "probing stream %d pp:%d\n", st->index, st->probe_packets);
         --st->probe_packets;
@@ -653,7 +716,7 @@ no_packet:
                 || end) {
                 pd->buf_size = 0;
                 av_freep(&pd->buf);
-                st->request_probe = -1;
+                st->internal->request_probe = -1;
                 if (st->codecpar->codec_id != AV_CODEC_ID_NONE) {
                     av_log(s, AV_LOG_DEBUG, "probed stream %d\n", st->index);
                 } else
@@ -674,7 +737,7 @@ static int update_wrap_reference(AVFormatContext *s, AVStream *st, int stream_in
 
     if (ref == AV_NOPTS_VALUE)
         ref = pkt->pts;
-    if (st->pts_wrap_reference != AV_NOPTS_VALUE || st->pts_wrap_bits >= 63 || ref == AV_NOPTS_VALUE || !s->correct_ts_overflow)
+    if (st->internal->pts_wrap_reference != AV_NOPTS_VALUE || st->pts_wrap_bits >= 63 || ref == AV_NOPTS_VALUE || !s->correct_ts_overflow)
         return 0;
     ref &= (1LL << st->pts_wrap_bits)-1;
 
@@ -689,17 +752,17 @@ static int update_wrap_reference(AVFormatContext *s, AVStream *st, int stream_in
 
     if (!first_program) {
         int default_stream_index = av_find_default_stream_index(s);
-        if (s->streams[default_stream_index]->pts_wrap_reference == AV_NOPTS_VALUE) {
+        if (s->streams[default_stream_index]->internal->pts_wrap_reference == AV_NOPTS_VALUE) {
             for (i = 0; i < s->nb_streams; i++) {
                 if (av_find_program_from_stream(s, NULL, i))
                     continue;
-                s->streams[i]->pts_wrap_reference = pts_wrap_reference;
-                s->streams[i]->pts_wrap_behavior = pts_wrap_behavior;
+                s->streams[i]->internal->pts_wrap_reference = pts_wrap_reference;
+                s->streams[i]->internal->pts_wrap_behavior = pts_wrap_behavior;
             }
         }
         else {
-            st->pts_wrap_reference = s->streams[default_stream_index]->pts_wrap_reference;
-            st->pts_wrap_behavior = s->streams[default_stream_index]->pts_wrap_behavior;
+            st->internal->pts_wrap_reference = s->streams[default_stream_index]->internal->pts_wrap_reference;
+            st->internal->pts_wrap_behavior = s->streams[default_stream_index]->internal->pts_wrap_behavior;
         }
     }
     else {
@@ -718,8 +781,8 @@ static int update_wrap_reference(AVFormatContext *s, AVStream *st, int stream_in
         while (program) {
             if (program->pts_wrap_reference != pts_wrap_reference) {
                 for (i = 0; i<program->nb_stream_indexes; i++) {
-                    s->streams[program->stream_index[i]]->pts_wrap_reference = pts_wrap_reference;
-                    s->streams[program->stream_index[i]]->pts_wrap_behavior = pts_wrap_behavior;
+                    s->streams[program->stream_index[i]]->internal->pts_wrap_reference = pts_wrap_reference;
+                    s->streams[program->stream_index[i]]->internal->pts_wrap_behavior = pts_wrap_behavior;
                 }
 
                 program->pts_wrap_reference = pts_wrap_reference;
@@ -736,28 +799,31 @@ int ff_read_packet(AVFormatContext *s, AVPacket *pkt)
     int ret, i, err;
     AVStream *st;
 
+    pkt->data = NULL;
+    pkt->size = 0;
+    av_init_packet(pkt);
+
     for (;;) {
         AVPacketList *pktl = s->internal->raw_packet_buffer;
+        const AVPacket *pkt1;
 
         if (pktl) {
-            *pkt = pktl->pkt;
-            st   = s->streams[pkt->stream_index];
+            st = s->streams[pktl->pkt.stream_index];
             if (s->internal->raw_packet_buffer_remaining_size <= 0)
                 if ((err = probe_codec(s, st, NULL)) < 0)
                     return err;
-            if (st->request_probe <= 0) {
-                s->internal->raw_packet_buffer                 = pktl->next;
+            if (st->internal->request_probe <= 0) {
+                avpriv_packet_list_get(&s->internal->raw_packet_buffer,
+                                   &s->internal->raw_packet_buffer_end, pkt);
                 s->internal->raw_packet_buffer_remaining_size += pkt->size;
-                av_free(pktl);
                 return 0;
             }
         }
 
-        pkt->data = NULL;
-        pkt->size = 0;
-        av_init_packet(pkt);
         ret = s->iformat->read_packet(s, pkt);
         if (ret < 0) {
+            av_packet_unref(pkt);
+
             /* Some demuxers return FFERROR_REDO when they consume
                data and discard it (ignored streams, junk, extradata).
                We must re-call the demuxer to get the real packet. */
@@ -767,39 +833,38 @@ int ff_read_packet(AVFormatContext *s, AVPacket *pkt)
                 return ret;
             for (i = 0; i < s->nb_streams; i++) {
                 st = s->streams[i];
-                if (st->probe_packets)
+                if (st->probe_packets || st->internal->request_probe > 0)
                     if ((err = probe_codec(s, st, NULL)) < 0)
                         return err;
-                av_assert0(st->request_probe <= 0);
+                av_assert0(st->internal->request_probe <= 0);
             }
             continue;
         }
 
-        if (!pkt->buf) {
-            AVPacket tmp = { 0 };
-            ret = av_packet_ref(&tmp, pkt);
-            if (ret < 0)
-                return ret;
-            *pkt = tmp;
-        }
-
-        if ((s->flags & AVFMT_FLAG_DISCARD_CORRUPT) &&
-            (pkt->flags & AV_PKT_FLAG_CORRUPT)) {
-            av_log(s, AV_LOG_WARNING,
-                   "Dropped corrupted packet (stream = %d)\n",
-                   pkt->stream_index);
+        err = av_packet_make_refcounted(pkt);
+        if (err < 0) {
             av_packet_unref(pkt);
-            continue;
+            return err;
         }
 
-        if (pkt->stream_index >= (unsigned)s->nb_streams) {
-            av_log(s, AV_LOG_ERROR, "Invalid stream index %d\n", pkt->stream_index);
-            continue;
+        if (pkt->flags & AV_PKT_FLAG_CORRUPT) {
+            av_log(s, AV_LOG_WARNING,
+                   "Packet corrupt (stream = %d, dts = %s)",
+                   pkt->stream_index, av_ts2str(pkt->dts));
+            if (s->flags & AVFMT_FLAG_DISCARD_CORRUPT) {
+                av_log(s, AV_LOG_WARNING, ", dropping it.\n");
+                av_packet_unref(pkt);
+                continue;
+            }
+            av_log(s, AV_LOG_WARNING, ".\n");
         }
+
+        av_assert0(pkt->stream_index < (unsigned)s->nb_streams &&
+                   "Invalid stream index.\n");
 
         st = s->streams[pkt->stream_index];
 
-        if (update_wrap_reference(s, st, pkt->stream_index, pkt) && st->pts_wrap_behavior == AV_PTS_WRAP_SUB_OFFSET) {
+        if (update_wrap_reference(s, st, pkt->stream_index, pkt) && st->internal->pts_wrap_behavior == AV_PTS_WRAP_SUB_OFFSET) {
             // correct first time stamps to negative values
             if (!is_relative(st->first_dts))
                 st->first_dts = wrap_timestamp(st, st->first_dts);
@@ -818,16 +883,20 @@ int ff_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (s->use_wallclock_as_timestamps)
             pkt->dts = pkt->pts = av_rescale_q(av_gettime(), AV_TIME_BASE_Q, st->time_base);
 
-        if (!pktl && st->request_probe <= 0)
+        if (!pktl && st->internal->request_probe <= 0)
             return ret;
 
-        err = add_to_pktbuf(&s->internal->raw_packet_buffer, pkt,
-                            &s->internal->raw_packet_buffer_end, 0);
-        if (err)
+        err = avpriv_packet_list_put(&s->internal->raw_packet_buffer,
+                                 &s->internal->raw_packet_buffer_end,
+                                 pkt, NULL, 0);
+        if (err < 0) {
+            av_packet_unref(pkt);
             return err;
-        s->internal->raw_packet_buffer_remaining_size -= pkt->size;
+        }
+        pkt1 = &s->internal->raw_packet_buffer_end->pkt;
+        s->internal->raw_packet_buffer_remaining_size -= pkt1->size;
 
-        if ((err = probe_codec(s, st, pkt)) < 0)
+        if ((err = probe_codec(s, st, pkt1)) < 0)
             return err;
     }
 }
@@ -837,12 +906,14 @@ int ff_read_packet(AVFormatContext *s, AVPacket *pkt)
 
 static int determinable_frame_size(AVCodecContext *avctx)
 {
-    if (/*avctx->codec_id == AV_CODEC_ID_AAC ||*/
-        avctx->codec_id == AV_CODEC_ID_MP1 ||
-        avctx->codec_id == AV_CODEC_ID_MP2 ||
-        avctx->codec_id == AV_CODEC_ID_MP3/* ||
-        avctx->codec_id == AV_CODEC_ID_CELT*/)
+    switch(avctx->codec_id) {
+    case AV_CODEC_ID_MP1:
+    case AV_CODEC_ID_MP2:
+    case AV_CODEC_ID_MP3:
+    case AV_CODEC_ID_CODEC2:
         return 1;
+    }
+
     return 0;
 }
 
@@ -912,12 +983,13 @@ FF_ENABLE_DEPRECATION_WARNINGS
     }
 }
 
-static int is_intra_only(enum AVCodecID id)
+int ff_is_intra_only(enum AVCodecID id)
 {
     const AVCodecDescriptor *d = avcodec_descriptor_get(id);
     if (!d)
         return 0;
-    if (d->type == AVMEDIA_TYPE_VIDEO && !(d->props & AV_CODEC_PROP_INTRA_ONLY))
+    if ((d->type == AVMEDIA_TYPE_VIDEO || d->type == AVMEDIA_TYPE_AUDIO) &&
+        !(d->props & AV_CODEC_PROP_INTRA_ONLY))
         return 0;
     return 1;
 }
@@ -925,7 +997,7 @@ static int is_intra_only(enum AVCodecID id)
 static int has_decode_delay_been_guessed(AVStream *st)
 {
     if (st->codecpar->codec_id != AV_CODEC_ID_H264) return 1;
-    if (!st->info) // if we have left find_stream_info then nb_decoded_frames won't increase anymore for stream copy
+    if (!st->internal->info) // if we have left find_stream_info then nb_decoded_frames won't increase anymore for stream copy
         return 1;
 #if CONFIG_H264_DECODER
     if (st->internal->avctx->has_b_frames &&
@@ -933,11 +1005,11 @@ static int has_decode_delay_been_guessed(AVStream *st)
         return 1;
 #endif
     if (st->internal->avctx->has_b_frames<3)
-        return st->nb_decoded_frames >= 7;
+        return st->internal->nb_decoded_frames >= 7;
     else if (st->internal->avctx->has_b_frames<4)
-        return st->nb_decoded_frames >= 18;
+        return st->internal->nb_decoded_frames >= 18;
     else
-        return st->nb_decoded_frames >= 20;
+        return st->internal->nb_decoded_frames >= 20;
 }
 
 static AVPacketList *get_next_pkt(AVFormatContext *s, AVStream *st, AVPacketList *pktl)
@@ -960,8 +1032,8 @@ static int64_t select_from_pts_buffer(AVStream *st, int64_t *pts_buffer, int64_t
         if (dts == AV_NOPTS_VALUE) {
             int64_t best_score = INT64_MAX;
             for (i = 0; i<delay; i++) {
-                if (st->pts_reorder_error_count[i]) {
-                    int64_t score = st->pts_reorder_error[i] / st->pts_reorder_error_count[i];
+                if (st->internal->pts_reorder_error_count[i]) {
+                    int64_t score = st->internal->pts_reorder_error[i] / st->internal->pts_reorder_error_count[i];
                     if (score < best_score) {
                         best_score = score;
                         dts = pts_buffer[i];
@@ -972,13 +1044,13 @@ static int64_t select_from_pts_buffer(AVStream *st, int64_t *pts_buffer, int64_t
             for (i = 0; i<delay; i++) {
                 if (pts_buffer[i] != AV_NOPTS_VALUE) {
                     int64_t diff =  FFABS(pts_buffer[i] - dts)
-                                    + (uint64_t)st->pts_reorder_error[i];
-                    diff = FFMAX(diff, st->pts_reorder_error[i]);
-                    st->pts_reorder_error[i] = diff;
-                    st->pts_reorder_error_count[i]++;
-                    if (st->pts_reorder_error_count[i] > 250) {
-                        st->pts_reorder_error[i] >>= 1;
-                        st->pts_reorder_error_count[i] >>= 1;
+                                    + (uint64_t)st->internal->pts_reorder_error[i];
+                    diff = FFMAX(diff, st->internal->pts_reorder_error[i]);
+                    st->internal->pts_reorder_error[i] = diff;
+                    st->internal->pts_reorder_error_count[i]++;
+                    if (st->internal->pts_reorder_error_count[i] > 250) {
+                        st->internal->pts_reorder_error[i] >>= 1;
+                        st->internal->pts_reorder_error_count[i] >>= 1;
                     }
                 }
             }
@@ -1033,6 +1105,7 @@ static void update_initial_timestamps(AVFormatContext *s, int stream_index,
     if (st->first_dts != AV_NOPTS_VALUE ||
         dts           == AV_NOPTS_VALUE ||
         st->cur_dts   == AV_NOPTS_VALUE ||
+        st->cur_dts < INT_MIN + RELATIVE_TS_BASE ||
         is_relative(dts))
         return;
 
@@ -1055,7 +1128,7 @@ static void update_initial_timestamps(AVFormatContext *s, int stream_index,
         if (st->start_time == AV_NOPTS_VALUE && pktl_it->pkt.pts != AV_NOPTS_VALUE) {
             st->start_time = pktl_it->pkt.pts;
             if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && st->codecpar->sample_rate)
-                st->start_time += av_rescale_q(st->skip_samples, (AVRational){1, st->codecpar->sample_rate}, st->time_base);
+                st->start_time = av_sat_add64(st->start_time, av_rescale_q(st->internal->skip_samples, (AVRational){1, st->codecpar->sample_rate}, st->time_base));
         }
     }
 
@@ -1064,22 +1137,24 @@ static void update_initial_timestamps(AVFormatContext *s, int stream_index,
     }
 
     if (st->start_time == AV_NOPTS_VALUE) {
-        st->start_time = pts;
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO || !(pkt->flags & AV_PKT_FLAG_DISCARD)) {
+            st->start_time = pts;
+        }
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && st->codecpar->sample_rate)
-            st->start_time += av_rescale_q(st->skip_samples, (AVRational){1, st->codecpar->sample_rate}, st->time_base);
+            st->start_time = av_sat_add64(st->start_time, av_rescale_q(st->internal->skip_samples, (AVRational){1, st->codecpar->sample_rate}, st->time_base));
     }
 }
 
 static void update_initial_durations(AVFormatContext *s, AVStream *st,
-                                     int stream_index, int duration)
+                                     int stream_index, int64_t duration)
 {
     AVPacketList *pktl = s->internal->packet_buffer ? s->internal->packet_buffer : s->internal->parse_queue;
     int64_t cur_dts    = RELATIVE_TS_BASE;
 
     if (st->first_dts != AV_NOPTS_VALUE) {
-        if (st->update_initial_durations_done)
+        if (st->internal->update_initial_durations_done)
             return;
-        st->update_initial_durations_done = 1;
+        st->internal->update_initial_durations_done = 1;
         cur_dts = st->first_dts;
         for (; pktl; pktl = get_next_pkt(s, st, pktl)) {
             if (pktl->pkt.stream_index == stream_index) {
@@ -1107,14 +1182,16 @@ static void update_initial_durations(AVFormatContext *s, AVStream *st,
     for (; pktl; pktl = get_next_pkt(s, st, pktl)) {
         if (pktl->pkt.stream_index != stream_index)
             continue;
-        if (pktl->pkt.pts == pktl->pkt.dts  &&
-            (pktl->pkt.dts == AV_NOPTS_VALUE || pktl->pkt.dts == st->first_dts) &&
+        if ((pktl->pkt.pts == pktl->pkt.dts ||
+             pktl->pkt.pts == AV_NOPTS_VALUE) &&
+            (pktl->pkt.dts == AV_NOPTS_VALUE ||
+             pktl->pkt.dts == st->first_dts ||
+             pktl->pkt.dts == RELATIVE_TS_BASE) &&
             !pktl->pkt.duration) {
             pktl->pkt.dts = cur_dts;
             if (!st->internal->avctx->has_b_frames)
                 pktl->pkt.pts = cur_dts;
-//            if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
-                pktl->pkt.duration = duration;
+            pktl->pkt.duration = duration;
         } else
             break;
         cur_dts = pktl->pkt.dts + pktl->pkt.duration;
@@ -1137,24 +1214,24 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
         return;
 
     if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && pkt->dts != AV_NOPTS_VALUE) {
-        if (pkt->dts == pkt->pts && st->last_dts_for_order_check != AV_NOPTS_VALUE) {
-            if (st->last_dts_for_order_check <= pkt->dts) {
-                st->dts_ordered++;
+        if (pkt->dts == pkt->pts && st->internal->last_dts_for_order_check != AV_NOPTS_VALUE) {
+            if (st->internal->last_dts_for_order_check <= pkt->dts) {
+                st->internal->dts_ordered++;
             } else {
-                av_log(s, st->dts_misordered ? AV_LOG_DEBUG : AV_LOG_WARNING,
+                av_log(s, st->internal->dts_misordered ? AV_LOG_DEBUG : AV_LOG_WARNING,
                        "DTS %"PRIi64" < %"PRIi64" out of order\n",
                        pkt->dts,
-                       st->last_dts_for_order_check);
-                st->dts_misordered++;
+                       st->internal->last_dts_for_order_check);
+                st->internal->dts_misordered++;
             }
-            if (st->dts_ordered + st->dts_misordered > 250) {
-                st->dts_ordered    >>= 1;
-                st->dts_misordered >>= 1;
+            if (st->internal->dts_ordered + st->internal->dts_misordered > 250) {
+                st->internal->dts_ordered    >>= 1;
+                st->internal->dts_misordered >>= 1;
             }
         }
 
-        st->last_dts_for_order_check = pkt->dts;
-        if (st->dts_ordered < 8*st->dts_misordered && pkt->dts == pkt->pts)
+        st->internal->last_dts_for_order_check = pkt->dts;
+        if (st->internal->dts_ordered < 8*st->internal->dts_misordered && pkt->dts == pkt->pts)
             pkt->dts = AV_NOPTS_VALUE;
     }
 
@@ -1198,7 +1275,7 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
     }
 
     duration = av_mul_q((AVRational) {pkt->duration, 1}, st->time_base);
-    if (pkt->duration == 0) {
+    if (pkt->duration <= 0) {
         ff_compute_frame_duration(s, &num, &den, st, pc, pkt);
         if (den && num) {
             duration = (AVRational) {num, den};
@@ -1209,7 +1286,7 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
         }
     }
 
-    if (pkt->duration != 0 && (s->internal->packet_buffer || s->internal->parse_queue))
+    if (pkt->duration > 0 && (s->internal->packet_buffer || s->internal->parse_queue))
         update_initial_durations(s, st, pkt->stream_index, pkt->duration);
 
     /* Correct timestamps with byte offset if demuxers only have timestamps
@@ -1230,7 +1307,7 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
         presentation_delayed = 1;
 
     if (s->debug & FF_FDEBUG_TS)
-        av_log(s, AV_LOG_TRACE,
+        av_log(s, AV_LOG_DEBUG,
             "IN delayed:%d pts:%s, dts:%s cur_dts:%s st:%d pc:%p duration:%"PRId64" delay:%d onein_oneout:%d\n",
             presentation_delayed, av_ts2str(pkt->pts), av_ts2str(pkt->dts), av_ts2str(st->cur_dts),
             pkt->stream_index, pc, pkt->duration, delay, onein_oneout);
@@ -1250,10 +1327,10 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
 
             /* This is tricky: the dts must be incremented by the duration
              * of the frame we are displaying, i.e. the last I- or P-frame. */
-            if (st->last_IP_duration == 0)
+            if (st->last_IP_duration == 0 && (uint64_t)pkt->duration <= INT32_MAX)
                 st->last_IP_duration = pkt->duration;
             if (pkt->dts != AV_NOPTS_VALUE)
-                st->cur_dts = pkt->dts + st->last_IP_duration;
+                st->cur_dts = av_sat_add64(pkt->dts, st->last_IP_duration);
             if (pkt->dts != AV_NOPTS_VALUE &&
                 pkt->pts == AV_NOPTS_VALUE &&
                 st->last_IP_duration > 0 &&
@@ -1262,13 +1339,14 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
                 next_pts != AV_NOPTS_VALUE)
                 pkt->pts = next_dts;
 
-            st->last_IP_duration = pkt->duration;
+            if ((uint64_t)pkt->duration <= INT32_MAX)
+                st->last_IP_duration = pkt->duration;
             st->last_IP_pts      = pkt->pts;
             /* Cannot compute PTS if not present (we can compute it only
              * by knowing the future. */
         } else if (pkt->pts != AV_NOPTS_VALUE ||
                    pkt->dts != AV_NOPTS_VALUE ||
-                   pkt->duration                ) {
+                   pkt->duration > 0             ) {
 
             /* presentation is not delayed : PTS and DTS are the same */
             if (pkt->pts == AV_NOPTS_VALUE)
@@ -1278,18 +1356,18 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
             if (pkt->pts == AV_NOPTS_VALUE)
                 pkt->pts = st->cur_dts;
             pkt->dts = pkt->pts;
-            if (pkt->pts != AV_NOPTS_VALUE)
+            if (pkt->pts != AV_NOPTS_VALUE && duration.num >= 0)
                 st->cur_dts = av_add_stable(st->time_base, pkt->pts, duration, 1);
         }
     }
 
     if (pkt->pts != AV_NOPTS_VALUE && delay <= MAX_REORDER_DELAY) {
-        st->pts_buffer[0] = pkt->pts;
-        for (i = 0; i<delay && st->pts_buffer[i] > st->pts_buffer[i + 1]; i++)
-            FFSWAP(int64_t, st->pts_buffer[i], st->pts_buffer[i + 1]);
+        st->internal->pts_buffer[0] = pkt->pts;
+        for (i = 0; i<delay && st->internal->pts_buffer[i] > st->internal->pts_buffer[i + 1]; i++)
+            FFSWAP(int64_t, st->internal->pts_buffer[i], st->internal->pts_buffer[i + 1]);
 
         if(has_decode_delay_been_guessed(st))
-            pkt->dts = select_from_pts_buffer(st, st->pts_buffer, pkt->dts);
+            pkt->dts = select_from_pts_buffer(st, st->internal->pts_buffer, pkt->dts);
     }
     // We skipped it above so we try here.
     if (!onein_oneout)
@@ -1299,11 +1377,11 @@ static void compute_pkt_fields(AVFormatContext *s, AVStream *st,
         st->cur_dts = pkt->dts;
 
     if (s->debug & FF_FDEBUG_TS)
-        av_log(s, AV_LOG_TRACE, "OUTdelayed:%d/%d pts:%s, dts:%s cur_dts:%s\n",
-            presentation_delayed, delay, av_ts2str(pkt->pts), av_ts2str(pkt->dts), av_ts2str(st->cur_dts));
+        av_log(s, AV_LOG_DEBUG, "OUTdelayed:%d/%d pts:%s, dts:%s cur_dts:%s st:%d (%d)\n",
+            presentation_delayed, delay, av_ts2str(pkt->pts), av_ts2str(pkt->dts), av_ts2str(st->cur_dts), st->index, st->id);
 
     /* update flags */
-    if (is_intra_only(st->codecpar->codec_id))
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA || ff_is_intra_only(st->codecpar->codec_id))
         pkt->flags |= AV_PKT_FLAG_KEY;
 #if FF_API_CONVERGENCE_DURATION
 FF_DISABLE_DEPRECATION_WARNINGS
@@ -1313,45 +1391,33 @@ FF_ENABLE_DEPRECATION_WARNINGS
 #endif
 }
 
-static void free_packet_buffer(AVPacketList **pkt_buf, AVPacketList **pkt_buf_end)
-{
-    while (*pkt_buf) {
-        AVPacketList *pktl = *pkt_buf;
-        *pkt_buf = pktl->next;
-        av_packet_unref(&pktl->pkt);
-        av_freep(&pktl);
-    }
-    *pkt_buf_end = NULL;
-}
-
 /**
  * Parse a packet, add all split parts to parse_queue.
  *
- * @param pkt Packet to parse, NULL when flushing the parser at end of stream.
+ * @param pkt   Packet to parse; must not be NULL.
+ * @param flush Indicates whether to flush. If set, pkt must be blank.
  */
-static int parse_packet(AVFormatContext *s, AVPacket *pkt, int stream_index)
+static int parse_packet(AVFormatContext *s, AVPacket *pkt,
+                        int stream_index, int flush)
 {
-    AVPacket out_pkt = { 0 }, flush_pkt = { 0 };
+    AVPacket out_pkt;
     AVStream *st = s->streams[stream_index];
-    uint8_t *data = pkt ? pkt->data : NULL;
-    int size      = pkt ? pkt->size : 0;
-    int ret = 0, got_output = 0;
+    uint8_t *data = pkt->data;
+    int size      = pkt->size;
+    int ret = 0, got_output = flush;
 
-    if (!pkt) {
-        av_init_packet(&flush_pkt);
-        pkt        = &flush_pkt;
-        got_output = 1;
-    } else if (!size && st->parser->flags & PARSER_FLAG_COMPLETE_FRAMES) {
+    if (size || flush) {
+        av_init_packet(&out_pkt);
+    } else if (st->parser->flags & PARSER_FLAG_COMPLETE_FRAMES) {
         // preserve 0-size sync packets
         compute_pkt_fields(s, st, st->parser, pkt, AV_NOPTS_VALUE, AV_NOPTS_VALUE);
     }
 
-    while (size > 0 || (pkt == &flush_pkt && got_output)) {
+    while (size > 0 || (flush && got_output)) {
         int len;
         int64_t next_pts = pkt->pts;
         int64_t next_dts = pkt->dts;
 
-        av_init_packet(&out_pkt);
         len = av_parser_parse2(st->parser, st->internal->avctx,
                                &out_pkt.data, &out_pkt.size, data, size,
                                pkt->pts, pkt->dts, pkt->pos);
@@ -1366,6 +1432,22 @@ static int parse_packet(AVFormatContext *s, AVPacket *pkt, int stream_index)
 
         if (!out_pkt.size)
             continue;
+
+        if (pkt->buf && out_pkt.data == pkt->data) {
+            /* reference pkt->buf only when out_pkt.data is guaranteed to point
+             * to data in it and not in the parser's internal buffer. */
+            /* XXX: Ensure this is the case with all parsers when st->parser->flags
+             * is PARSER_FLAG_COMPLETE_FRAMES and check for that instead? */
+            out_pkt.buf = av_buffer_ref(pkt->buf);
+            if (!out_pkt.buf) {
+                ret = AVERROR(ENOMEM);
+                goto fail;
+            }
+        } else {
+            ret = av_packet_make_refcounted(&out_pkt);
+            if (ret < 0)
+                goto fail;
+        }
 
         if (pkt->side_data) {
             out_pkt.side_data       = pkt->side_data;
@@ -1390,6 +1472,7 @@ static int parse_packet(AVFormatContext *s, AVPacket *pkt, int stream_index)
         out_pkt.pts          = st->parser->pts;
         out_pkt.dts          = st->parser->dts;
         out_pkt.pos          = st->parser->pos;
+        out_pkt.flags       |= pkt->flags & AV_PKT_FLAG_DISCARD;
 
         if (st->need_parsing == AVSTREAM_PARSE_FULL_RAW)
             out_pkt.pos = st->parser->frame_offset;
@@ -1404,15 +1487,17 @@ static int parse_packet(AVFormatContext *s, AVPacket *pkt, int stream_index)
 
         compute_pkt_fields(s, st, st->parser, &out_pkt, next_dts, next_pts);
 
-        ret = add_to_pktbuf(&s->internal->parse_queue, &out_pkt,
-                            &s->internal->parse_queue_end, 1);
-        av_packet_unref(&out_pkt);
-        if (ret < 0)
+        ret = avpriv_packet_list_put(&s->internal->parse_queue,
+                                 &s->internal->parse_queue_end,
+                                 &out_pkt, NULL, 0);
+        if (ret < 0) {
+            av_packet_unref(&out_pkt);
             goto fail;
+        }
     }
 
     /* end of the stream => close and free the parser */
-    if (pkt == &flush_pkt) {
+    if (flush) {
         av_parser_close(st->parser);
         st->parser = NULL;
     }
@@ -1422,21 +1507,6 @@ fail:
     return ret;
 }
 
-static int read_from_packet_buffer(AVPacketList **pkt_buffer,
-                                   AVPacketList **pkt_buffer_end,
-                                   AVPacket      *pkt)
-{
-    AVPacketList *pktl;
-    av_assert0(*pkt_buffer);
-    pktl        = *pkt_buffer;
-    *pkt        = pktl->pkt;
-    *pkt_buffer = pktl->next;
-    if (!pktl->next)
-        *pkt_buffer_end = NULL;
-    av_freep(&pktl);
-    return 0;
-}
-
 static int64_t ts_to_samples(AVStream *st, int64_t ts)
 {
     return av_rescale(ts, st->time_base.num * st->codecpar->sample_rate, st->time_base.den);
@@ -1444,17 +1514,14 @@ static int64_t ts_to_samples(AVStream *st, int64_t ts)
 
 static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
 {
-    int ret = 0, i, got_packet = 0;
+    int ret, i, got_packet = 0;
     AVDictionary *metadata = NULL;
-
-    av_init_packet(pkt);
 
     while (!got_packet && !s->internal->parse_queue) {
         AVStream *st;
-        AVPacket cur_pkt;
 
         /* read next packet */
-        ret = ff_read_packet(s, &cur_pkt);
+        ret = ff_read_packet(s, pkt);
         if (ret < 0) {
             if (ret == AVERROR(EAGAIN))
                 return ret;
@@ -1462,56 +1529,68 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
             for (i = 0; i < s->nb_streams; i++) {
                 st = s->streams[i];
                 if (st->parser && st->need_parsing)
-                    parse_packet(s, NULL, st->index);
+                    parse_packet(s, pkt, st->index, 1);
             }
             /* all remaining packets are now in parse_queue =>
              * really terminate parsing */
             break;
         }
         ret = 0;
-        st  = s->streams[cur_pkt.stream_index];
+        st  = s->streams[pkt->stream_index];
+
+        st->event_flags |= AVSTREAM_EVENT_FLAG_NEW_PACKETS;
 
         /* update context if required */
         if (st->internal->need_context_update) {
             if (avcodec_is_open(st->internal->avctx)) {
                 av_log(s, AV_LOG_DEBUG, "Demuxer context update while decoder is open, closing and trying to re-open\n");
                 avcodec_close(st->internal->avctx);
-                st->info->found_decoder = 0;
+                st->internal->info->found_decoder = 0;
+            }
+
+            /* close parser, because it depends on the codec */
+            if (st->parser && st->internal->avctx->codec_id != st->codecpar->codec_id) {
+                av_parser_close(st->parser);
+                st->parser = NULL;
             }
 
             ret = avcodec_parameters_to_context(st->internal->avctx, st->codecpar);
-            if (ret < 0)
+            if (ret < 0) {
+                av_packet_unref(pkt);
                 return ret;
+            }
 
 #if FF_API_LAVF_AVCTX
 FF_DISABLE_DEPRECATION_WARNINGS
             /* update deprecated public codec context */
             ret = avcodec_parameters_to_context(st->codec, st->codecpar);
-            if (ret < 0)
+            if (ret < 0) {
+                av_packet_unref(pkt);
                 return ret;
+            }
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
 
             st->internal->need_context_update = 0;
         }
 
-        if (cur_pkt.pts != AV_NOPTS_VALUE &&
-            cur_pkt.dts != AV_NOPTS_VALUE &&
-            cur_pkt.pts < cur_pkt.dts) {
+        if (pkt->pts != AV_NOPTS_VALUE &&
+            pkt->dts != AV_NOPTS_VALUE &&
+            pkt->pts < pkt->dts) {
             av_log(s, AV_LOG_WARNING,
                    "Invalid timestamps stream=%d, pts=%s, dts=%s, size=%d\n",
-                   cur_pkt.stream_index,
-                   av_ts2str(cur_pkt.pts),
-                   av_ts2str(cur_pkt.dts),
-                   cur_pkt.size);
+                   pkt->stream_index,
+                   av_ts2str(pkt->pts),
+                   av_ts2str(pkt->dts),
+                   pkt->size);
         }
         if (s->debug & FF_FDEBUG_TS)
             av_log(s, AV_LOG_DEBUG,
                    "ff_read_packet stream=%d, pts=%s, dts=%s, size=%d, duration=%"PRId64", flags=%d\n",
-                   cur_pkt.stream_index,
-                   av_ts2str(cur_pkt.pts),
-                   av_ts2str(cur_pkt.dts),
-                   cur_pkt.size, cur_pkt.duration, cur_pkt.flags);
+                   pkt->stream_index,
+                   av_ts2str(pkt->pts),
+                   av_ts2str(pkt->dts),
+                   pkt->size, pkt->duration, pkt->flags);
 
         if (st->need_parsing && !st->parser && !(s->flags & AVFMT_FLAG_NOPARSE)) {
             st->parser = av_parser_init(st->codecpar->codec_id);
@@ -1531,7 +1610,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
         if (!st->need_parsing || !st->parser) {
             /* no parsing needed: we just output the packet as is */
-            *pkt = cur_pkt;
             compute_pkt_fields(s, st, NULL, pkt, AV_NOPTS_VALUE, AV_NOPTS_VALUE);
             if ((s->iformat->flags & AVFMT_GENERIC_INDEX) &&
                 (pkt->flags & AV_PKT_FLAG_KEY) && pkt->dts != AV_NOPTS_VALUE) {
@@ -1541,7 +1619,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
             }
             got_packet = 1;
         } else if (st->discard < AVDISCARD_ALL) {
-            if ((ret = parse_packet(s, &cur_pkt, cur_pkt.stream_index)) < 0)
+            if ((ret = parse_packet(s, pkt, pkt->stream_index, 0)) < 0)
                 return ret;
             st->codecpar->sample_rate = st->internal->avctx->sample_rate;
             st->codecpar->bit_rate = st->internal->avctx->bit_rate;
@@ -1550,47 +1628,44 @@ FF_ENABLE_DEPRECATION_WARNINGS
             st->codecpar->codec_id = st->internal->avctx->codec_id;
         } else {
             /* free packet */
-            av_packet_unref(&cur_pkt);
+            av_packet_unref(pkt);
         }
         if (pkt->flags & AV_PKT_FLAG_KEY)
-            st->skip_to_keyframe = 0;
-        if (st->skip_to_keyframe) {
-            av_packet_unref(&cur_pkt);
-            if (got_packet) {
-                *pkt = cur_pkt;
-            }
+            st->internal->skip_to_keyframe = 0;
+        if (st->internal->skip_to_keyframe) {
+            av_packet_unref(pkt);
             got_packet = 0;
         }
     }
 
     if (!got_packet && s->internal->parse_queue)
-        ret = read_from_packet_buffer(&s->internal->parse_queue, &s->internal->parse_queue_end, pkt);
+        ret = avpriv_packet_list_get(&s->internal->parse_queue, &s->internal->parse_queue_end, pkt);
 
     if (ret >= 0) {
         AVStream *st = s->streams[pkt->stream_index];
         int discard_padding = 0;
-        if (st->first_discard_sample && pkt->pts != AV_NOPTS_VALUE) {
+        if (st->internal->first_discard_sample && pkt->pts != AV_NOPTS_VALUE) {
             int64_t pts = pkt->pts - (is_relative(pkt->pts) ? RELATIVE_TS_BASE : 0);
             int64_t sample = ts_to_samples(st, pts);
             int duration = ts_to_samples(st, pkt->duration);
             int64_t end_sample = sample + duration;
-            if (duration > 0 && end_sample >= st->first_discard_sample &&
-                sample < st->last_discard_sample)
-                discard_padding = FFMIN(end_sample - st->first_discard_sample, duration);
+            if (duration > 0 && end_sample >= st->internal->first_discard_sample &&
+                sample < st->internal->last_discard_sample)
+                discard_padding = FFMIN(end_sample - st->internal->first_discard_sample, duration);
         }
-        if (st->start_skip_samples && (pkt->pts == 0 || pkt->pts == RELATIVE_TS_BASE))
-            st->skip_samples = st->start_skip_samples;
-        if (st->skip_samples || discard_padding) {
+        if (st->internal->start_skip_samples && (pkt->pts == 0 || pkt->pts == RELATIVE_TS_BASE))
+            st->internal->skip_samples = st->internal->start_skip_samples;
+        if (st->internal->skip_samples || discard_padding) {
             uint8_t *p = av_packet_new_side_data(pkt, AV_PKT_DATA_SKIP_SAMPLES, 10);
             if (p) {
-                AV_WL32(p, st->skip_samples);
+                AV_WL32(p, st->internal->skip_samples);
                 AV_WL32(p + 4, discard_padding);
-                av_log(s, AV_LOG_DEBUG, "demuxer injecting skip %d / discard %d\n", st->skip_samples, discard_padding);
+                av_log(s, AV_LOG_DEBUG, "demuxer injecting skip %d / discard %d\n", st->internal->skip_samples, discard_padding);
             }
-            st->skip_samples = 0;
+            st->internal->skip_samples = 0;
         }
 
-        if (st->inject_global_side_data) {
+        if (st->internal->inject_global_side_data) {
             for (i = 0; i < st->nb_side_data; i++) {
                 AVPacketSideData *src_sd = &st->side_data[i];
                 uint8_t *dst_data;
@@ -1606,11 +1681,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
                 memcpy(dst_data, src_sd->data, src_sd->size);
             }
-            st->inject_global_side_data = 0;
+            st->internal->inject_global_side_data = 0;
         }
-
-        if (!(s->flags & AVFMT_FLAG_KEEP_SIDE_DATA))
-            av_packet_merge_side_data(pkt);
     }
 
     av_opt_get_dict_val(s, "metadata", AV_OPT_SEARCH_CHILDREN, &metadata);
@@ -1634,6 +1706,11 @@ FF_ENABLE_DEPRECATION_WARNINGS
                av_ts2str(pkt->dts),
                pkt->size, pkt->duration, pkt->flags);
 
+    /* A demuxer might have returned EOF because of an IO error, let's
+     * propagate this back to the user. */
+    if (ret == AVERROR_EOF && s->pb && s->pb->error < 0 && s->pb->error != AVERROR(EAGAIN))
+        ret = s->pb->error;
+
     return ret;
 }
 
@@ -1646,7 +1723,7 @@ int av_read_frame(AVFormatContext *s, AVPacket *pkt)
 
     if (!genpts) {
         ret = s->internal->packet_buffer
-              ? read_from_packet_buffer(&s->internal->packet_buffer,
+              ? avpriv_packet_list_get(&s->internal->packet_buffer,
                                         &s->internal->packet_buffer_end, pkt)
               : read_frame_internal(s, pkt);
         if (ret < 0)
@@ -1665,10 +1742,11 @@ int av_read_frame(AVFormatContext *s, AVPacket *pkt)
                 // last dts seen for this stream. if any of packets following
                 // current one had no dts, we will set this to AV_NOPTS_VALUE.
                 int64_t last_dts = next_pkt->dts;
+                av_assert2(wrap_bits <= 64);
                 while (pktl && next_pkt->pts == AV_NOPTS_VALUE) {
                     if (pktl->pkt.stream_index == next_pkt->stream_index &&
-                        (av_compare_mod(next_pkt->dts, pktl->pkt.dts, 2LL << (wrap_bits - 1)) < 0)) {
-                        if (av_compare_mod(pktl->pkt.pts, pktl->pkt.dts, 2LL << (wrap_bits - 1))) {
+                        av_compare_mod(next_pkt->dts, pktl->pkt.dts, 2ULL << (wrap_bits - 1)) < 0) {
+                        if (av_compare_mod(pktl->pkt.pts, pktl->pkt.dts, 2ULL << (wrap_bits - 1))) {
                             // not B-frame
                             next_pkt->pts = pktl->pkt.dts;
                         }
@@ -1694,7 +1772,7 @@ int av_read_frame(AVFormatContext *s, AVPacket *pkt)
             st = s->streams[next_pkt->stream_index];
             if (!(next_pkt->pts == AV_NOPTS_VALUE && st->discard < AVDISCARD_ALL &&
                   next_pkt->dts != AV_NOPTS_VALUE && !eof)) {
-                ret = read_from_packet_buffer(&s->internal->packet_buffer,
+                ret = avpriv_packet_list_get(&s->internal->packet_buffer,
                                                &s->internal->packet_buffer_end, pkt);
                 goto return_packet;
             }
@@ -1709,11 +1787,13 @@ int av_read_frame(AVFormatContext *s, AVPacket *pkt)
                 return ret;
         }
 
-        ret = add_to_pktbuf(&s->internal->packet_buffer, pkt,
-                            &s->internal->packet_buffer_end, 1);
-        av_packet_unref(pkt);
-        if (ret < 0)
+        ret = avpriv_packet_list_put(&s->internal->packet_buffer,
+                                 &s->internal->packet_buffer_end,
+                                 pkt, NULL, 0);
+        if (ret < 0) {
+            av_packet_unref(pkt);
             return ret;
+        }
     }
 
 return_packet:
@@ -1737,9 +1817,9 @@ static void flush_packet_queue(AVFormatContext *s)
 {
     if (!s->internal)
         return;
-    free_packet_buffer(&s->internal->parse_queue,       &s->internal->parse_queue_end);
-    free_packet_buffer(&s->internal->packet_buffer,     &s->internal->packet_buffer_end);
-    free_packet_buffer(&s->internal->raw_packet_buffer, &s->internal->raw_packet_buffer_end);
+    avpriv_packet_list_free(&s->internal->parse_queue,       &s->internal->parse_queue_end);
+    avpriv_packet_list_free(&s->internal->packet_buffer,     &s->internal->packet_buffer_end);
+    avpriv_packet_list_free(&s->internal->raw_packet_buffer, &s->internal->raw_packet_buffer_end);
 
     s->internal->raw_packet_buffer_remaining_size = RAW_PACKET_BUFFER_SIZE;
 }
@@ -1801,22 +1881,22 @@ void ff_read_frame_flush(AVFormatContext *s)
             st->parser = NULL;
         }
         st->last_IP_pts = AV_NOPTS_VALUE;
-        st->last_dts_for_order_check = AV_NOPTS_VALUE;
+        st->internal->last_dts_for_order_check = AV_NOPTS_VALUE;
         if (st->first_dts == AV_NOPTS_VALUE)
             st->cur_dts = RELATIVE_TS_BASE;
         else
             /* We set the current DTS to an unspecified origin. */
             st->cur_dts = AV_NOPTS_VALUE;
 
-        st->probe_packets = MAX_PROBE_PACKETS;
+        st->probe_packets = s->max_probe_packets;
 
         for (j = 0; j < MAX_REORDER_DELAY + 1; j++)
-            st->pts_buffer[j] = AV_NOPTS_VALUE;
+            st->internal->pts_buffer[j] = AV_NOPTS_VALUE;
 
         if (s->internal->inject_global_side_data)
-            st->inject_global_side_data = 1;
+            st->internal->inject_global_side_data = 1;
 
-        st->skip_samples = 0;
+        st->internal->skip_samples = 0;
     }
 }
 
@@ -1839,11 +1919,11 @@ void ff_reduce_index(AVFormatContext *s, int stream_index)
     AVStream *st             = s->streams[stream_index];
     unsigned int max_entries = s->max_index_size / sizeof(AVIndexEntry);
 
-    if ((unsigned) st->nb_index_entries >= max_entries) {
+    if ((unsigned) st->internal->nb_index_entries >= max_entries) {
         int i;
-        for (i = 0; 2 * i < st->nb_index_entries; i++)
-            st->index_entries[i] = st->index_entries[2 * i];
-        st->nb_index_entries = i;
+        for (i = 0; 2 * i < st->internal->nb_index_entries; i++)
+            st->internal->index_entries[i] = st->internal->index_entries[2 * i];
+        st->internal->nb_index_entries = i;
     }
 }
 
@@ -1910,8 +1990,8 @@ int av_add_index_entry(AVStream *st, int64_t pos, int64_t timestamp,
                        int size, int distance, int flags)
 {
     timestamp = wrap_timestamp(st, timestamp);
-    return ff_add_index_entry(&st->index_entries, &st->nb_index_entries,
-                              &st->index_entries_allocated_size, pos,
+    return ff_add_index_entry(&st->internal->index_entries, &st->internal->nb_index_entries,
+                              &st->internal->index_entries_allocated_size, pos,
                               timestamp, size, distance, flags);
 }
 
@@ -1930,6 +2010,16 @@ int ff_index_search_timestamp(const AVIndexEntry *entries, int nb_entries,
 
     while (b - a > 1) {
         m         = (a + b) >> 1;
+
+        // Search for the next non-discarded packet.
+        while ((entries[m].flags & AVINDEX_DISCARD_FRAME) && m < b && m < nb_entries - 1) {
+            m++;
+            if (m == b && entries[m].timestamp >= wanted_timestamp) {
+                m = b - 1;
+                break;
+            }
+        }
+
         timestamp = entries[m].timestamp;
         if (timestamp >= wanted_timestamp)
             b = m;
@@ -1954,7 +2044,9 @@ void ff_configure_buffers_for_index(AVFormatContext *s, int64_t time_tolerance)
     int64_t pos_delta = 0;
     int64_t skip = 0;
     //We could use URLProtocol flags here but as many user applications do not use URLProtocols this would be unreliable
-    const char *proto = avio_find_protocol_name(s->filename);
+    const char *proto = avio_find_protocol_name(s->url);
+
+    av_assert0(time_tolerance >= 0);
 
     if (!proto) {
         av_log(s, AV_LOG_INFO,
@@ -1975,15 +2067,15 @@ void ff_configure_buffers_for_index(AVFormatContext *s, int64_t time_tolerance)
             if (ist1 == ist2)
                 continue;
 
-            for (i1 = i2 = 0; i1 < st1->nb_index_entries; i1++) {
-                AVIndexEntry *e1 = &st1->index_entries[i1];
+            for (i1 = i2 = 0; i1 < st1->internal->nb_index_entries; i1++) {
+                AVIndexEntry *e1 = &st1->internal->index_entries[i1];
                 int64_t e1_pts = av_rescale_q(e1->timestamp, st1->time_base, AV_TIME_BASE_Q);
 
                 skip = FFMAX(skip, e1->size);
-                for (; i2 < st2->nb_index_entries; i2++) {
-                    AVIndexEntry *e2 = &st2->index_entries[i2];
+                for (; i2 < st2->internal->nb_index_entries; i2++) {
+                    AVIndexEntry *e2 = &st2->internal->index_entries[i2];
                     int64_t e2_pts = av_rescale_q(e2->timestamp, st2->time_base, AV_TIME_BASE_Q);
-                    if (e2_pts - e1_pts < time_tolerance)
+                    if (e2_pts < e1_pts || e2_pts - (uint64_t)e1_pts < time_tolerance)
                         continue;
                     pos_delta = FFMAX(pos_delta, e1->pos - e2->pos);
                     break;
@@ -1996,7 +2088,13 @@ void ff_configure_buffers_for_index(AVFormatContext *s, int64_t time_tolerance)
     /* XXX This could be adjusted depending on protocol*/
     if (s->pb->buffer_size < pos_delta && pos_delta < (1<<24)) {
         av_log(s, AV_LOG_VERBOSE, "Reconfiguring buffers to size %"PRId64"\n", pos_delta);
-        ffio_set_buf_size(s->pb, pos_delta);
+
+        /* realloc the buffer and the original data will be retained */
+        if (ffio_realloc_buf(s->pb, pos_delta)) {
+            av_log(s, AV_LOG_ERROR, "Realloc buffer fail.\n");
+            return;
+        }
+
         s->pb->short_seek_threshold = FFMAX(s->pb->short_seek_threshold, pos_delta/2);
     }
 
@@ -2007,7 +2105,7 @@ void ff_configure_buffers_for_index(AVFormatContext *s, int64_t time_tolerance)
 
 int av_index_search_timestamp(AVStream *st, int64_t wanted_timestamp, int flags)
 {
-    return ff_index_search_timestamp(st->index_entries, st->nb_index_entries,
+    return ff_index_search_timestamp(st->internal->index_entries, st->internal->nb_index_entries,
                                      wanted_timestamp, flags);
 }
 
@@ -2023,7 +2121,7 @@ static int64_t ff_read_timestamp(AVFormatContext *s, int stream_index, int64_t *
 int ff_seek_frame_binary(AVFormatContext *s, int stream_index,
                          int64_t target_ts, int flags)
 {
-    AVInputFormat *avif = s->iformat;
+    const AVInputFormat *avif = s->iformat;
     int64_t av_uninit(pos_min), av_uninit(pos_max), pos, pos_limit;
     int64_t ts_min, ts_max, ts;
     int index;
@@ -2040,7 +2138,7 @@ int ff_seek_frame_binary(AVFormatContext *s, int stream_index,
     pos_limit = -1; // GCC falsely says it may be uninitialized.
 
     st = s->streams[stream_index];
-    if (st->index_entries) {
+    if (st->internal->index_entries) {
         AVIndexEntry *e;
 
         /* FIXME: Whole function must be checked for non-keyframe entries in
@@ -2048,7 +2146,7 @@ int ff_seek_frame_binary(AVFormatContext *s, int stream_index,
         index = av_index_search_timestamp(st, target_ts,
                                           flags | AVSEEK_FLAG_BACKWARD);
         index = FFMAX(index, 0);
-        e     = &st->index_entries[index];
+        e     = &st->internal->index_entries[index];
 
         if (e->timestamp <= target_ts || e->pos == e->min_distance) {
             pos_min = e->pos;
@@ -2061,9 +2159,9 @@ int ff_seek_frame_binary(AVFormatContext *s, int stream_index,
 
         index = av_index_search_timestamp(st, target_ts,
                                           flags & ~AVSEEK_FLAG_BACKWARD);
-        av_assert0(index < st->nb_index_entries);
+        av_assert0(index < st->internal->nb_index_entries);
         if (index >= 0) {
-            e = &st->index_entries[index];
+            e = &st->internal->index_entries[index];
             av_assert1(e->timestamp >= target_ts);
             pos_max   = e->pos;
             ts_max    = e->timestamp;
@@ -2264,17 +2362,17 @@ static int seek_frame_generic(AVFormatContext *s, int stream_index,
 
     index = av_index_search_timestamp(st, timestamp, flags);
 
-    if (index < 0 && st->nb_index_entries &&
-        timestamp < st->index_entries[0].timestamp)
+    if (index < 0 && st->internal->nb_index_entries &&
+        timestamp < st->internal->index_entries[0].timestamp)
         return -1;
 
-    if (index < 0 || index == st->nb_index_entries - 1) {
+    if (index < 0 || index == st->internal->nb_index_entries - 1) {
         AVPacket pkt;
         int nonkey = 0;
 
-        if (st->nb_index_entries) {
-            av_assert0(st->index_entries);
-            ie = &st->index_entries[st->nb_index_entries - 1];
+        if (st->internal->nb_index_entries) {
+            av_assert0(st->internal->index_entries);
+            ie = &st->internal->index_entries[st->internal->nb_index_entries - 1];
             if ((ret = avio_seek(s->pb, ie->pos, SEEK_SET)) < 0)
                 return ret;
             ff_update_cur_dts(s, st, ie->timestamp);
@@ -2311,7 +2409,7 @@ static int seek_frame_generic(AVFormatContext *s, int stream_index,
     if (s->iformat->read_seek)
         if (s->iformat->read_seek(s, stream_index, timestamp, flags) >= 0)
             return 0;
-    ie = &st->index_entries[index];
+    ie = &st->internal->index_entries[index];
     if ((ret = avio_seek(s->pb, ie->pos, SEEK_SET)) < 0)
         return ret;
     ff_update_cur_dts(s, st, ie->timestamp);
@@ -2411,6 +2509,7 @@ int avformat_seek_file(AVFormatContext *s, int stream_index, int64_t min_ts,
             max_ts = av_rescale_rnd(max_ts, time_base.den,
                                     time_base.num * (int64_t)AV_TIME_BASE,
                                     AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
+            stream_index = 0;
         }
 
         ret = s->iformat->read_seek2(s, stream_index, min_ts,
@@ -2477,32 +2576,38 @@ static int has_duration(AVFormatContext *ic)
  */
 static void update_stream_timings(AVFormatContext *ic)
 {
-    int64_t start_time, start_time1, start_time_text, end_time, end_time1;
-    int64_t duration, duration1, filesize;
+    int64_t start_time, start_time1, start_time_text, end_time, end_time1, end_time_text;
+    int64_t duration, duration1, duration_text, filesize;
     int i;
-    AVStream *st;
     AVProgram *p;
 
     start_time = INT64_MAX;
     start_time_text = INT64_MAX;
     end_time   = INT64_MIN;
+    end_time_text   = INT64_MIN;
     duration   = INT64_MIN;
+    duration_text = INT64_MIN;
+
     for (i = 0; i < ic->nb_streams; i++) {
-        st = ic->streams[i];
+        AVStream *st = ic->streams[i];
+        int is_text = st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
+                      st->codecpar->codec_type == AVMEDIA_TYPE_DATA;
         if (st->start_time != AV_NOPTS_VALUE && st->time_base.den) {
             start_time1 = av_rescale_q(st->start_time, st->time_base,
                                        AV_TIME_BASE_Q);
-            if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE || st->codecpar->codec_type == AVMEDIA_TYPE_DATA) {
-                if (start_time1 < start_time_text)
-                    start_time_text = start_time1;
-            } else
+            if (is_text)
+                start_time_text = FFMIN(start_time_text, start_time1);
+            else
                 start_time = FFMIN(start_time, start_time1);
             end_time1 = av_rescale_q_rnd(st->duration, st->time_base,
                                          AV_TIME_BASE_Q,
                                          AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
-            if (end_time1 != AV_NOPTS_VALUE && start_time1 <= INT64_MAX - end_time1) {
+            if (end_time1 != AV_NOPTS_VALUE && (end_time1 > 0 ? start_time1 <= INT64_MAX - end_time1 : start_time1 >= INT64_MIN - end_time1)) {
                 end_time1 += start_time1;
-                end_time = FFMAX(end_time, end_time1);
+                if (is_text)
+                    end_time_text = FFMAX(end_time_text, end_time1);
+                else
+                    end_time = FFMAX(end_time, end_time1);
             }
             for (p = NULL; (p = av_find_program_from_stream(ic, p, i)); ) {
                 if (p->start_time == AV_NOPTS_VALUE || p->start_time > start_time1)
@@ -2514,25 +2619,41 @@ static void update_stream_timings(AVFormatContext *ic)
         if (st->duration != AV_NOPTS_VALUE) {
             duration1 = av_rescale_q(st->duration, st->time_base,
                                      AV_TIME_BASE_Q);
-            duration  = FFMAX(duration, duration1);
+            if (is_text)
+                duration_text = FFMAX(duration_text, duration1);
+            else
+                duration = FFMAX(duration, duration1);
         }
     }
-    if (start_time == INT64_MAX || (start_time > start_time_text && start_time - start_time_text < AV_TIME_BASE))
+    if (start_time == INT64_MAX || (start_time > start_time_text && start_time - (uint64_t)start_time_text < AV_TIME_BASE))
         start_time = start_time_text;
     else if (start_time > start_time_text)
         av_log(ic, AV_LOG_VERBOSE, "Ignoring outlier non primary stream starttime %f\n", start_time_text / (float)AV_TIME_BASE);
 
+    if (end_time == INT64_MIN || (end_time < end_time_text && end_time_text - (uint64_t)end_time < AV_TIME_BASE))
+        end_time = end_time_text;
+    else if (end_time < end_time_text)
+        av_log(ic, AV_LOG_VERBOSE, "Ignoring outlier non primary stream endtime %f\n", end_time_text / (float)AV_TIME_BASE);
+
+     if (duration == INT64_MIN || (duration < duration_text && duration_text - duration < AV_TIME_BASE))
+         duration = duration_text;
+     else if (duration < duration_text)
+         av_log(ic, AV_LOG_VERBOSE, "Ignoring outlier non primary stream duration %f\n", duration_text / (float)AV_TIME_BASE);
+
     if (start_time != INT64_MAX) {
         ic->start_time = start_time;
         if (end_time != INT64_MIN) {
-            if (ic->nb_programs) {
+            if (ic->nb_programs > 1) {
                 for (i = 0; i < ic->nb_programs; i++) {
                     p = ic->programs[i];
-                    if (p->start_time != AV_NOPTS_VALUE && p->end_time > p->start_time)
+                    if (p->start_time != AV_NOPTS_VALUE &&
+                        p->end_time > p->start_time &&
+                        p->end_time - (uint64_t)p->start_time <= INT64_MAX)
                         duration = FFMAX(duration, p->end_time - p->start_time);
                 }
-            } else
+            } else if (end_time >= start_time && end_time - (uint64_t)start_time <= INT64_MAX) {
                 duration = FFMAX(duration, end_time - start_time);
+            }
         }
     }
     if (duration != INT64_MIN && duration > 0 && ic->duration == AV_NOPTS_VALUE) {
@@ -2605,7 +2726,7 @@ static void estimate_timings_from_bit_rate(AVFormatContext *ic)
                 st      = ic->streams[i];
                 if (   st->time_base.num <= INT64_MAX / ic->bit_rate
                     && st->duration == AV_NOPTS_VALUE) {
-                    duration = av_rescale(8 * filesize, st->time_base.den,
+                    duration = av_rescale(filesize, 8LL * st->time_base.den,
                                           ic->bit_rate *
                                           (int64_t) st->time_base.num);
                     st->duration = duration;
@@ -2650,6 +2771,11 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
         }
     }
 
+    if (ic->skip_estimate_duration_from_pts) {
+        av_log(ic, AV_LOG_INFO, "Skipping duration calculation in estimate_timings_from_pts\n");
+        goto skip_duration_calc;
+    }
+
     av_opt_set(ic, "skip_changes", "1", AV_OPT_SEARCH_CHILDREN);
     /* estimate the end time (duration) */
     /* XXX: may need to support wrapping */
@@ -2692,10 +2818,10 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
                 else
                     duration -= st->first_dts;
                 if (duration > 0) {
-                    if (st->duration == AV_NOPTS_VALUE || st->info->last_duration<= 0 ||
-                        (st->duration < duration && FFABS(duration - st->info->last_duration) < 60LL*st->time_base.den / st->time_base.num))
+                    if (st->duration == AV_NOPTS_VALUE || st->internal->info->last_duration<= 0 ||
+                        (st->duration < duration && FFABS(duration - st->internal->info->last_duration) < 60LL*st->time_base.den / st->time_base.num))
                         st->duration = duration;
-                    st->info->last_duration = duration;
+                    st->internal->info->last_duration = duration;
                 }
             }
             av_packet_unref(pkt);
@@ -2728,12 +2854,13 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
             case AVMEDIA_TYPE_VIDEO:
             case AVMEDIA_TYPE_AUDIO:
                 if (st->start_time != AV_NOPTS_VALUE || st->first_dts  != AV_NOPTS_VALUE) {
-                    av_log(ic, AV_LOG_DEBUG, "stream %d : no PTS found at end of file, duration not set\n", i);
+                    av_log(ic, AV_LOG_WARNING, "stream %d : no PTS found at end of file, duration not set\n", i);
                 } else
-                    av_log(ic, AV_LOG_DEBUG, "stream %d : no TS found at start of file, duration not set\n", i);
+                    av_log(ic, AV_LOG_WARNING, "stream %d : no TS found at start of file, duration not set\n", i);
             }
         }
     }
+skip_duration_calc:
     fill_all_stream_timings(ic);
 
     avio_seek(ic->pb, old_offset, SEEK_SET);
@@ -2743,10 +2870,22 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
         st              = ic->streams[i];
         st->cur_dts     = st->first_dts;
         st->last_IP_pts = AV_NOPTS_VALUE;
-        st->last_dts_for_order_check = AV_NOPTS_VALUE;
+        st->internal->last_dts_for_order_check = AV_NOPTS_VALUE;
         for (j = 0; j < MAX_REORDER_DELAY + 1; j++)
-            st->pts_buffer[j] = AV_NOPTS_VALUE;
+            st->internal->pts_buffer[j] = AV_NOPTS_VALUE;
     }
+}
+
+/* 1:1 map to AVDurationEstimationMethod */
+static const char *const duration_name[] = {
+    [AVFMT_DURATION_FROM_PTS]     = "pts",
+    [AVFMT_DURATION_FROM_STREAM]  = "stream",
+    [AVFMT_DURATION_FROM_BITRATE] = "bit rate",
+};
+
+static const char *duration_estimate_name(enum AVDurationEstimationMethod method)
+{
+    return duration_name[method];
 }
 
 static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
@@ -2763,7 +2902,7 @@ static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
 
     if ((!strcmp(ic->iformat->name, "mpeg") ||
          !strcmp(ic->iformat->name, "mpegts")) &&
-        file_size && ic->pb->seekable) {
+        file_size && (ic->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         /* get accurate estimate from the PTSes */
         estimate_timings_from_pts(ic, old_offset);
         ic->duration_estimation_method = AVFMT_DURATION_FROM_PTS;
@@ -2771,7 +2910,11 @@ static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
         /* at least one component has timings - we use them for all
          * the components */
         fill_all_stream_timings(ic);
-        ic->duration_estimation_method = AVFMT_DURATION_FROM_STREAM;
+        /* nut demuxer estimate the duration from PTS */
+        if(!strcmp(ic->iformat->name, "nut"))
+            ic->duration_estimation_method = AVFMT_DURATION_FROM_PTS;
+        else
+            ic->duration_estimation_method = AVFMT_DURATION_FROM_STREAM;
     } else {
         /* less precise: use bitrate info */
         estimate_timings_from_bit_rate(ic);
@@ -2784,15 +2927,17 @@ static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
         AVStream av_unused *st;
         for (i = 0; i < ic->nb_streams; i++) {
             st = ic->streams[i];
-            av_log(ic, AV_LOG_TRACE, "stream %d: start_time: %0.3f duration: %0.3f\n", i,
-                   (double) st->start_time * av_q2d(st->time_base),
-                   (double) st->duration   * av_q2d(st->time_base));
+            if (st->time_base.den)
+                av_log(ic, AV_LOG_TRACE, "stream %d: start_time: %s duration: %s\n", i,
+                       av_ts2timestr(st->start_time, &st->time_base),
+                       av_ts2timestr(st->duration, &st->time_base));
         }
         av_log(ic, AV_LOG_TRACE,
-                "format: start_time: %0.3f duration: %0.3f bitrate=%"PRId64" kb/s\n",
-                (double) ic->start_time / AV_TIME_BASE,
-                (double) ic->duration   / AV_TIME_BASE,
-                (int64_t)ic->bit_rate / 1000);
+               "format: start_time: %s duration: %s (estimate from %s) bitrate=%"PRId64" kb/s\n",
+               av_ts2timestr(ic->start_time, &AV_TIME_BASE_Q),
+               av_ts2timestr(ic->duration, &AV_TIME_BASE_Q),
+               duration_estimate_name(ic->duration_estimation_method),
+               (int64_t)ic->bit_rate / 1000);
     }
 }
 
@@ -2813,20 +2958,20 @@ static int has_codec_parameters(AVStream *st, const char **errmsg_ptr)
     case AVMEDIA_TYPE_AUDIO:
         if (!avctx->frame_size && determinable_frame_size(avctx))
             FAIL("unspecified frame size");
-        if (st->info->found_decoder >= 0 &&
+        if (st->internal->info->found_decoder >= 0 &&
             avctx->sample_fmt == AV_SAMPLE_FMT_NONE)
             FAIL("unspecified sample format");
         if (!avctx->sample_rate)
             FAIL("unspecified sample rate");
         if (!avctx->channels)
             FAIL("unspecified number of channels");
-        if (st->info->found_decoder >= 0 && !st->nb_decoded_frames && avctx->codec_id == AV_CODEC_ID_DTS)
+        if (st->internal->info->found_decoder >= 0 && !st->internal->nb_decoded_frames && avctx->codec_id == AV_CODEC_ID_DTS)
             FAIL("no decodable DTS frames");
         break;
     case AVMEDIA_TYPE_VIDEO:
         if (!avctx->width)
             FAIL("unspecified size");
-        if (st->info->found_decoder >= 0 && avctx->pix_fmt == AV_PIX_FMT_NONE)
+        if (st->internal->info->found_decoder >= 0 && avctx->pix_fmt == AV_PIX_FMT_NONE)
             FAIL("unspecified pixel format");
         if (st->codecpar->codec_id == AV_CODEC_ID_RV30 || st->codecpar->codec_id == AV_CODEC_ID_RV40)
             if (!st->sample_aspect_ratio.num && !st->codecpar->sample_aspect_ratio.num && !st->codec_info_nb_frames)
@@ -2844,8 +2989,8 @@ static int has_codec_parameters(AVStream *st, const char **errmsg_ptr)
 }
 
 /* returns 1 or 0 if or if not decoded data was returned, or a negative error */
-static int try_decode_frame(AVFormatContext *s, AVStream *st, AVPacket *avpkt,
-                            AVDictionary **options)
+static int try_decode_frame(AVFormatContext *s, AVStream *st,
+                            const AVPacket *avpkt, AVDictionary **options)
 {
     AVCodecContext *avctx = st->internal->avctx;
     const AVCodec *codec;
@@ -2860,14 +3005,14 @@ static int try_decode_frame(AVFormatContext *s, AVStream *st, AVPacket *avpkt,
         return AVERROR(ENOMEM);
 
     if (!avcodec_is_open(avctx) &&
-        st->info->found_decoder <= 0 &&
-        (st->codecpar->codec_id != -st->info->found_decoder || !st->codecpar->codec_id)) {
+        st->internal->info->found_decoder <= 0 &&
+        (st->codecpar->codec_id != -st->internal->info->found_decoder || !st->codecpar->codec_id)) {
         AVDictionary *thread_opt = NULL;
 
-        codec = find_decoder(s, st, st->codecpar->codec_id);
+        codec = find_probe_decoder(s, st, st->codecpar->codec_id);
 
         if (!codec) {
-            st->info->found_decoder = -st->codecpar->codec_id;
+            st->internal->info->found_decoder = -st->codecpar->codec_id;
             ret                     = -1;
             goto fail;
         }
@@ -2881,14 +3026,14 @@ static int try_decode_frame(AVFormatContext *s, AVStream *st, AVPacket *avpkt,
         if (!options)
             av_dict_free(&thread_opt);
         if (ret < 0) {
-            st->info->found_decoder = -avctx->codec_id;
+            st->internal->info->found_decoder = -avctx->codec_id;
             goto fail;
         }
-        st->info->found_decoder = 1;
-    } else if (!st->info->found_decoder)
-        st->info->found_decoder = 1;
+        st->internal->info->found_decoder = 1;
+    } else if (!st->internal->info->found_decoder)
+        st->internal->info->found_decoder = 1;
 
-    if (st->info->found_decoder < 0) {
+    if (st->internal->info->found_decoder < 0) {
         ret = -1;
         goto fail;
     }
@@ -2920,12 +3065,14 @@ static int try_decode_frame(AVFormatContext *s, AVStream *st, AVPacket *avpkt,
         } else if (avctx->codec_type == AVMEDIA_TYPE_SUBTITLE) {
             ret = avcodec_decode_subtitle2(avctx, &subtitle,
                                            &got_picture, &pkt);
+            if (got_picture)
+                avsubtitle_free(&subtitle);
             if (ret >= 0)
                 pkt.size = 0;
         }
         if (ret >= 0) {
             if (got_picture)
-                st->nb_decoded_frames++;
+                st->internal->nb_decoded_frames++;
             ret       = got_picture;
         }
     }
@@ -2991,6 +3138,8 @@ enum AVCodecID ff_get_pcm_codec_id(int bps, int flt, int be, int sflags)
                 return be ? AV_CODEC_ID_PCM_S24BE : AV_CODEC_ID_PCM_S24LE;
             case 4:
                 return be ? AV_CODEC_ID_PCM_S32BE : AV_CODEC_ID_PCM_S32LE;
+            case 8:
+                return be ? AV_CODEC_ID_PCM_S64BE : AV_CODEC_ID_PCM_S64LE;
             default:
                 return AV_CODEC_ID_NONE;
             }
@@ -3047,31 +3196,51 @@ enum AVCodecID av_codec_get_id(const AVCodecTag *const *tags, unsigned int tag)
     return AV_CODEC_ID_NONE;
 }
 
-static void compute_chapters_end(AVFormatContext *s)
+static int chapter_start_cmp(const void *p1, const void *p2)
 {
-    unsigned int i, j;
+    AVChapter *ch1 = *(AVChapter**)p1;
+    AVChapter *ch2 = *(AVChapter**)p2;
+    int delta = av_compare_ts(ch1->start, ch1->time_base, ch2->start, ch2->time_base);
+    if (delta)
+        return delta;
+    return (ch1 > ch2) - (ch1 < ch2);
+}
+
+static int compute_chapters_end(AVFormatContext *s)
+{
+    unsigned int i;
     int64_t max_time = 0;
+    AVChapter **timetable = av_malloc(s->nb_chapters * sizeof(*timetable));
+
+    if (!timetable)
+        return AVERROR(ENOMEM);
 
     if (s->duration > 0 && s->start_time < INT64_MAX - s->duration)
         max_time = s->duration +
                        ((s->start_time == AV_NOPTS_VALUE) ? 0 : s->start_time);
 
     for (i = 0; i < s->nb_chapters; i++)
-        if (s->chapters[i]->end == AV_NOPTS_VALUE) {
-            AVChapter *ch = s->chapters[i];
-            int64_t end = max_time ? av_rescale_q(max_time, AV_TIME_BASE_Q,
-                                                  ch->time_base)
-                                   : INT64_MAX;
+        timetable[i] = s->chapters[i];
+    qsort(timetable, s->nb_chapters, sizeof(*timetable), chapter_start_cmp);
 
-            for (j = 0; j < s->nb_chapters; j++) {
-                AVChapter *ch1     = s->chapters[j];
+    for (i = 0; i < s->nb_chapters; i++)
+        if (timetable[i]->end == AV_NOPTS_VALUE) {
+            AVChapter *ch = timetable[i];
+            int64_t end = max_time ? av_rescale_q(max_time, AV_TIME_BASE_Q,
+                                                ch->time_base)
+                                : INT64_MAX;
+
+            if (i + 1 < s->nb_chapters) {
+                AVChapter *ch1     = timetable[i + 1];
                 int64_t next_start = av_rescale_q(ch1->start, ch1->time_base,
-                                                  ch->time_base);
-                if (j != i && next_start > ch->start && next_start < end)
+                                                ch->time_base);
+                if (next_start > ch->start && next_start < end)
                     end = next_start;
             }
-            ch->end = (end == INT64_MAX) ? ch->start : end;
+            ch->end = (end == INT64_MAX || end < ch->start) ? ch->start : end;
         }
+    av_free(timetable);
+    return 0;
 }
 
 static int get_std_framerate(int i)
@@ -3115,23 +3284,20 @@ static int tb_unreliable(AVCodecContext *c)
 
 int ff_alloc_extradata(AVCodecParameters *par, int size)
 {
-    int ret;
+    av_freep(&par->extradata);
+    par->extradata_size = 0;
 
-    if (size < 0 || size >= INT32_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
-        par->extradata = NULL;
-        par->extradata_size = 0;
+    if (size < 0 || size >= INT32_MAX - AV_INPUT_BUFFER_PADDING_SIZE)
         return AVERROR(EINVAL);
-    }
+
     par->extradata = av_malloc(size + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (par->extradata) {
-        memset(par->extradata + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-        par->extradata_size = size;
-        ret = 0;
-    } else {
-        par->extradata_size = 0;
-        ret = AVERROR(ENOMEM);
-    }
-    return ret;
+    if (!par->extradata)
+        return AVERROR(ENOMEM);
+
+    memset(par->extradata + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    par->extradata_size = size;
+
+    return 0;
 }
 
 int ff_get_extradata(AVFormatContext *s, AVCodecParameters *par, AVIOContext *pb, int size)
@@ -3153,57 +3319,59 @@ int ff_get_extradata(AVFormatContext *s, AVCodecParameters *par, AVIOContext *pb
 int ff_rfps_add_frame(AVFormatContext *ic, AVStream *st, int64_t ts)
 {
     int i, j;
-    int64_t last = st->info->last_dts;
+    int64_t last = st->internal->info->last_dts;
 
     if (   ts != AV_NOPTS_VALUE && last != AV_NOPTS_VALUE && ts > last
        && ts - (uint64_t)last < INT64_MAX) {
         double dts = (is_relative(ts) ?  ts - RELATIVE_TS_BASE : ts) * av_q2d(st->time_base);
         int64_t duration = ts - last;
 
-        if (!st->info->duration_error)
-            st->info->duration_error = av_mallocz(sizeof(st->info->duration_error[0])*2);
-        if (!st->info->duration_error)
+        if (!st->internal->info->duration_error)
+            st->internal->info->duration_error = av_mallocz(sizeof(st->internal->info->duration_error[0])*2);
+        if (!st->internal->info->duration_error)
             return AVERROR(ENOMEM);
 
 //         if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO)
 //             av_log(NULL, AV_LOG_ERROR, "%f\n", dts);
         for (i = 0; i<MAX_STD_TIMEBASES; i++) {
-            if (st->info->duration_error[0][1][i] < 1e10) {
+            if (st->internal->info->duration_error[0][1][i] < 1e10) {
                 int framerate = get_std_framerate(i);
                 double sdts = dts*framerate/(1001*12);
                 for (j= 0; j<2; j++) {
                     int64_t ticks = llrint(sdts+j*0.5);
                     double error= sdts - ticks + j*0.5;
-                    st->info->duration_error[j][0][i] += error;
-                    st->info->duration_error[j][1][i] += error*error;
+                    st->internal->info->duration_error[j][0][i] += error;
+                    st->internal->info->duration_error[j][1][i] += error*error;
                 }
             }
         }
-        st->info->duration_count++;
-        st->info->rfps_duration_sum += duration;
+        if (st->internal->info->rfps_duration_sum <= INT64_MAX - duration) {
+            st->internal->info->duration_count++;
+            st->internal->info->rfps_duration_sum += duration;
+        }
 
-        if (st->info->duration_count % 10 == 0) {
-            int n = st->info->duration_count;
+        if (st->internal->info->duration_count % 10 == 0) {
+            int n = st->internal->info->duration_count;
             for (i = 0; i<MAX_STD_TIMEBASES; i++) {
-                if (st->info->duration_error[0][1][i] < 1e10) {
-                    double a0     = st->info->duration_error[0][0][i] / n;
-                    double error0 = st->info->duration_error[0][1][i] / n - a0*a0;
-                    double a1     = st->info->duration_error[1][0][i] / n;
-                    double error1 = st->info->duration_error[1][1][i] / n - a1*a1;
+                if (st->internal->info->duration_error[0][1][i] < 1e10) {
+                    double a0     = st->internal->info->duration_error[0][0][i] / n;
+                    double error0 = st->internal->info->duration_error[0][1][i] / n - a0*a0;
+                    double a1     = st->internal->info->duration_error[1][0][i] / n;
+                    double error1 = st->internal->info->duration_error[1][1][i] / n - a1*a1;
                     if (error0 > 0.04 && error1 > 0.04) {
-                        st->info->duration_error[0][1][i] = 2e10;
-                        st->info->duration_error[1][1][i] = 2e10;
+                        st->internal->info->duration_error[0][1][i] = 2e10;
+                        st->internal->info->duration_error[1][1][i] = 2e10;
                     }
                 }
             }
         }
 
         // ignore the first 4 values, they might have some random jitter
-        if (st->info->duration_count > 3 && is_relative(ts) == is_relative(last))
-            st->info->duration_gcd = av_gcd(st->info->duration_gcd, duration);
+        if (st->internal->info->duration_count > 3 && is_relative(ts) == is_relative(last))
+            st->internal->info->duration_gcd = av_gcd(st->internal->info->duration_gcd, duration);
     }
     if (ts != AV_NOPTS_VALUE)
-        st->info->last_dts = ts;
+        st->internal->info->last_dts = ts;
 
     return 0;
 }
@@ -3220,9 +3388,9 @@ void ff_rfps_calculate(AVFormatContext *ic)
         // the check for tb_unreliable() is not completely correct, since this is not about handling
         // an unreliable/inexact time base, but a time base that is finer than necessary, as e.g.
         // ipmovie.c produces.
-        if (tb_unreliable(st->internal->avctx) && st->info->duration_count > 15 && st->info->duration_gcd > FFMAX(1, st->time_base.den/(500LL*st->time_base.num)) && !st->r_frame_rate.num)
-            av_reduce(&st->r_frame_rate.num, &st->r_frame_rate.den, st->time_base.den, st->time_base.num * st->info->duration_gcd, INT_MAX);
-        if (st->info->duration_count>1 && !st->r_frame_rate.num
+        if (tb_unreliable(st->internal->avctx) && st->internal->info->duration_count > 15 && st->internal->info->duration_gcd > FFMAX(1, st->time_base.den/(500LL*st->time_base.num)) && !st->r_frame_rate.num)
+            av_reduce(&st->r_frame_rate.num, &st->r_frame_rate.den, st->time_base.den, st->time_base.num * st->internal->info->duration_gcd, INT_MAX);
+        if (st->internal->info->duration_count>1 && !st->r_frame_rate.num
             && tb_unreliable(st->internal->avctx)) {
             int num = 0;
             double best_error= 0.01;
@@ -3231,19 +3399,19 @@ void ff_rfps_calculate(AVFormatContext *ic)
             for (j= 0; j<MAX_STD_TIMEBASES; j++) {
                 int k;
 
-                if (st->info->codec_info_duration &&
-                    st->info->codec_info_duration*av_q2d(st->time_base) < (1001*11.5)/get_std_framerate(j))
+                if (st->internal->info->codec_info_duration &&
+                    st->internal->info->codec_info_duration*av_q2d(st->time_base) < (1001*11.5)/get_std_framerate(j))
                     continue;
-                if (!st->info->codec_info_duration && get_std_framerate(j) < 1001*12)
+                if (!st->internal->info->codec_info_duration && get_std_framerate(j) < 1001*12)
                     continue;
 
-                if (av_q2d(st->time_base) * st->info->rfps_duration_sum / st->info->duration_count < (1001*12.0 * 0.8)/get_std_framerate(j))
+                if (av_q2d(st->time_base) * st->internal->info->rfps_duration_sum / st->internal->info->duration_count < (1001*12.0 * 0.8)/get_std_framerate(j))
                     continue;
 
                 for (k= 0; k<2; k++) {
-                    int n = st->info->duration_count;
-                    double a= st->info->duration_error[k][0][j] / n;
-                    double error= st->info->duration_error[k][1][j]/n - a*a;
+                    int n = st->internal->info->duration_count;
+                    double a= st->internal->info->duration_error[k][0][j] / n;
+                    double error= st->internal->info->duration_error[k][1][j]/n - a*a;
 
                     if (error < best_error && best_error> 0.000000001) {
                         best_error= error;
@@ -3258,20 +3426,147 @@ void ff_rfps_calculate(AVFormatContext *ic)
                 av_reduce(&st->r_frame_rate.num, &st->r_frame_rate.den, num, 12*1001, INT_MAX);
         }
         if (   !st->avg_frame_rate.num
-            && st->r_frame_rate.num && st->info->rfps_duration_sum
-            && st->info->codec_info_duration <= 0
-            && st->info->duration_count > 2
-            && fabs(1.0 / (av_q2d(st->r_frame_rate) * av_q2d(st->time_base)) - st->info->rfps_duration_sum / (double)st->info->duration_count) <= 1.0
+            && st->r_frame_rate.num && st->internal->info->rfps_duration_sum
+            && st->internal->info->codec_info_duration <= 0
+            && st->internal->info->duration_count > 2
+            && fabs(1.0 / (av_q2d(st->r_frame_rate) * av_q2d(st->time_base)) - st->internal->info->rfps_duration_sum / (double)st->internal->info->duration_count) <= 1.0
             ) {
             av_log(ic, AV_LOG_DEBUG, "Setting avg frame rate based on r frame rate\n");
             st->avg_frame_rate = st->r_frame_rate;
         }
 
-        av_freep(&st->info->duration_error);
-        st->info->last_dts = AV_NOPTS_VALUE;
-        st->info->duration_count = 0;
-        st->info->rfps_duration_sum = 0;
+        av_freep(&st->internal->info->duration_error);
+        st->internal->info->last_dts = AV_NOPTS_VALUE;
+        st->internal->info->duration_count = 0;
+        st->internal->info->rfps_duration_sum = 0;
     }
+}
+
+static int extract_extradata_check(AVStream *st)
+{
+    const AVBitStreamFilter *f;
+
+    f = av_bsf_get_by_name("extract_extradata");
+    if (!f)
+        return 0;
+
+    if (f->codec_ids) {
+        const enum AVCodecID *ids;
+        for (ids = f->codec_ids; *ids != AV_CODEC_ID_NONE; ids++)
+            if (*ids == st->codecpar->codec_id)
+                return 1;
+    }
+
+    return 0;
+}
+
+static int extract_extradata_init(AVStream *st)
+{
+    AVStreamInternal *sti = st->internal;
+    const AVBitStreamFilter *f;
+    int ret;
+
+    f = av_bsf_get_by_name("extract_extradata");
+    if (!f)
+        goto finish;
+
+    /* check that the codec id is supported */
+    ret = extract_extradata_check(st);
+    if (!ret)
+        goto finish;
+
+    sti->extract_extradata.pkt = av_packet_alloc();
+    if (!sti->extract_extradata.pkt)
+        return AVERROR(ENOMEM);
+
+    ret = av_bsf_alloc(f, &sti->extract_extradata.bsf);
+    if (ret < 0)
+        goto fail;
+
+    ret = avcodec_parameters_copy(sti->extract_extradata.bsf->par_in,
+                                  st->codecpar);
+    if (ret < 0)
+        goto fail;
+
+    sti->extract_extradata.bsf->time_base_in = st->time_base;
+
+    ret = av_bsf_init(sti->extract_extradata.bsf);
+    if (ret < 0)
+        goto fail;
+
+finish:
+    sti->extract_extradata.inited = 1;
+
+    return 0;
+fail:
+    av_bsf_free(&sti->extract_extradata.bsf);
+    av_packet_free(&sti->extract_extradata.pkt);
+    return ret;
+}
+
+static int extract_extradata(AVStream *st, const AVPacket *pkt)
+{
+    AVStreamInternal *sti = st->internal;
+    AVPacket *pkt_ref;
+    int ret;
+
+    if (!sti->extract_extradata.inited) {
+        ret = extract_extradata_init(st);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (sti->extract_extradata.inited && !sti->extract_extradata.bsf)
+        return 0;
+
+    pkt_ref = sti->extract_extradata.pkt;
+    ret = av_packet_ref(pkt_ref, pkt);
+    if (ret < 0)
+        return ret;
+
+    ret = av_bsf_send_packet(sti->extract_extradata.bsf, pkt_ref);
+    if (ret < 0) {
+        av_packet_unref(pkt_ref);
+        return ret;
+    }
+
+    while (ret >= 0 && !sti->avctx->extradata) {
+        ret = av_bsf_receive_packet(sti->extract_extradata.bsf, pkt_ref);
+        if (ret < 0) {
+            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+                return ret;
+            continue;
+        }
+
+        for (int i = 0; i < pkt_ref->side_data_elems; i++) {
+            AVPacketSideData *side_data = &pkt_ref->side_data[i];
+            if (side_data->type == AV_PKT_DATA_NEW_EXTRADATA) {
+                sti->avctx->extradata      = side_data->data;
+                sti->avctx->extradata_size = side_data->size;
+                side_data->data = NULL;
+                side_data->size = 0;
+                break;
+            }
+        }
+        av_packet_unref(pkt_ref);
+    }
+
+    return 0;
+}
+
+static int add_coded_side_data(AVStream *st, AVCodecContext *avctx)
+{
+    int i;
+
+    for (i = 0; i < avctx->nb_coded_side_data; i++) {
+        const AVPacketSideData *sd_src = &avctx->coded_side_data[i];
+        uint8_t *dst_data;
+        dst_data = av_stream_new_side_data(st, sd_src->type, sd_src->size);
+        if (!dst_data)
+            return AVERROR(ENOMEM);
+        memcpy(dst_data, sd_src->data, sd_src->size);
+    }
+    return 0;
 }
 
 int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
@@ -3280,7 +3575,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
     int64_t read_size;
     AVStream *st;
     AVCodecContext *avctx;
-    AVPacket pkt1, *pkt;
+    AVPacket pkt1;
     int64_t old_offset  = avio_tell(ic->pb);
     // new streams might appear, no options for those
     int orig_nb_streams = ic->nb_streams;
@@ -3290,6 +3585,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
     int64_t max_subtitle_analyze_duration;
     int64_t probesize = ic->probesize;
     int eof_reached = 0;
+    int *missing_streams = av_opt_ptr(ic->iformat->priv_class, ic->priv_data, "missing_streams");
 
     flush_codecs = probesize > 0;
 
@@ -3324,8 +3620,19 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
             if (!avctx->time_base.num)
                 avctx->time_base = st->time_base;
         }
+
+        /* check if the caller has overridden the codec id */
+#if FF_API_LAVF_AVCTX
+FF_DISABLE_DEPRECATION_WARNINGS
+        if (st->codec->codec_id != st->internal->orig_codec_id) {
+            st->codecpar->codec_id   = st->codec->codec_id;
+            st->codecpar->codec_type = st->codec->codec_type;
+            st->internal->orig_codec_id = st->codec->codec_id;
+        }
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
         // only for the split stuff
-        if (!st->parser && !(ic->flags & AVFMT_FLAG_NOPARSE) && st->request_probe <= 0) {
+        if (!st->parser && !(ic->flags & AVFMT_FLAG_NOPARSE) && st->internal->request_probe <= 0) {
             st->parser = av_parser_init(st->codecpar->codec_id);
             if (st->parser) {
                 if (st->need_parsing == AVSTREAM_PARSE_HEADERS) {
@@ -3340,26 +3647,16 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
             }
         }
 
-        /* check if the caller has overridden the codec id */
-#if FF_API_LAVF_AVCTX
-FF_DISABLE_DEPRECATION_WARNINGS
-        if (st->codec->codec_id != st->internal->orig_codec_id) {
-            st->codecpar->codec_id   = st->codec->codec_id;
-            st->codecpar->codec_type = st->codec->codec_type;
-            st->internal->orig_codec_id = st->codec->codec_id;
-        }
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
         if (st->codecpar->codec_id != st->internal->orig_codec_id)
             st->internal->orig_codec_id = st->codecpar->codec_id;
 
         ret = avcodec_parameters_to_context(avctx, st->codecpar);
         if (ret < 0)
             goto find_stream_info_err;
-        if (st->request_probe <= 0)
+        if (st->internal->request_probe <= 0)
             st->internal->avctx_inited = 1;
 
-        codec = find_decoder(ic, st, st->codecpar->codec_id);
+        codec = find_probe_decoder(ic, st, st->codecpar->codec_id);
 
         /* Force thread count to 1 since the H.264 decoder will not extract
          * SPS and PPS to extradata during multi-threaded decoding. */
@@ -3373,15 +3670,15 @@ FF_ENABLE_DEPRECATION_WARNINGS
             && codec && !avctx->codec) {
             if (avcodec_open2(avctx, codec, options ? &options[i] : &thread_opt) < 0)
                 av_log(ic, AV_LOG_WARNING,
-                       "Failed to open codec in av_find_stream_info\n");
+                       "Failed to open codec in %s\n",__FUNCTION__);
         }
 
         // Try to just open decoders, in case this is enough to get parameters.
-        if (!has_codec_parameters(st, NULL) && st->request_probe <= 0) {
+        if (!has_codec_parameters(st, NULL) && st->internal->request_probe <= 0) {
             if (codec && !avctx->codec)
                 if (avcodec_open2(avctx, codec, options ? &options[i] : &thread_opt) < 0)
                     av_log(ic, AV_LOG_WARNING,
-                           "Failed to open codec in av_find_stream_info\n");
+                           "Failed to open codec in %s\n",__FUNCTION__);
         }
         if (!options)
             av_dict_free(&thread_opt);
@@ -3389,14 +3686,15 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     for (i = 0; i < ic->nb_streams; i++) {
 #if FF_API_R_FRAME_RATE
-        ic->streams[i]->info->last_dts = AV_NOPTS_VALUE;
+        ic->streams[i]->internal->info->last_dts = AV_NOPTS_VALUE;
 #endif
-        ic->streams[i]->info->fps_first_dts = AV_NOPTS_VALUE;
-        ic->streams[i]->info->fps_last_dts  = AV_NOPTS_VALUE;
+        ic->streams[i]->internal->info->fps_first_dts = AV_NOPTS_VALUE;
+        ic->streams[i]->internal->info->fps_last_dts  = AV_NOPTS_VALUE;
     }
 
     read_size = 0;
     for (;;) {
+        const AVPacket *pkt;
         int analyzed_all_streams;
         if (ff_check_interrupt(&ic->interrupt_callback)) {
             ret = AVERROR_EXIT;
@@ -3407,6 +3705,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
         /* check if one codec still needs to be handled */
         for (i = 0; i < ic->nb_streams; i++) {
             int fps_analyze_framecount = 20;
+            int count;
 
             st = ic->streams[i];
             if (!has_codec_parameters(st, NULL))
@@ -3423,16 +3722,22 @@ FF_ENABLE_DEPRECATION_WARNINGS
             if (st->disposition & AV_DISPOSITION_ATTACHED_PIC)
                 fps_analyze_framecount = 0;
             /* variable fps and no guess at the real fps */
+            count = (ic->iformat->flags & AVFMT_NOTIMESTAMPS) ?
+                       st->internal->info->codec_info_duration_fields/2 :
+                       st->internal->info->duration_count;
             if (!(st->r_frame_rate.num && st->avg_frame_rate.num) &&
                 st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-                int count = (ic->iformat->flags & AVFMT_NOTIMESTAMPS) ?
-                    st->info->codec_info_duration_fields/2 :
-                    st->info->duration_count;
                 if (count < fps_analyze_framecount)
                     break;
             }
-            if (st->parser && st->parser->parser->split &&
-                !st->codecpar->extradata)
+            // Look at the first 3 frames if there is evidence of frame delay
+            // but the decoder delay is not set.
+            if (st->internal->info->frame_delay_evidence && count < 2 && st->internal->avctx->has_b_frames == 0)
+                break;
+            if (!st->internal->avctx->extradata &&
+                (!st->internal->extract_extradata.inited ||
+                 st->internal->extract_extradata.bsf) &&
+                extract_extradata_check(st))
                 break;
             if (st->first_dts == AV_NOPTS_VALUE &&
                 !(ic->iformat->flags & AVFMT_NOTIMESTAMPS) &&
@@ -3442,18 +3747,19 @@ FF_ENABLE_DEPRECATION_WARNINGS
                 break;
         }
         analyzed_all_streams = 0;
-        if (i == ic->nb_streams) {
-            analyzed_all_streams = 1;
-            /* NOTE: If the format has no header, then we need to read some
-             * packets to get most of the streams, so we cannot stop here. */
-            if (!(ic->ctx_flags & AVFMTCTX_NOHEADER)) {
-                /* If we found the info for all the codecs, we can stop. */
-                ret = count;
-                av_log(ic, AV_LOG_DEBUG, "All info found\n");
-                flush_codecs = 0;
-                break;
+        if (!missing_streams || !*missing_streams)
+            if (i == ic->nb_streams) {
+                analyzed_all_streams = 1;
+                /* NOTE: If the format has no header, then we need to read some
+                 * packets to get most of the streams, so we cannot stop here. */
+                if (!(ic->ctx_flags & AVFMTCTX_NOHEADER)) {
+                    /* If we found the info for all the codecs, we can stop. */
+                    ret = count;
+                    av_log(ic, AV_LOG_DEBUG, "All info found\n");
+                    flush_codecs = 0;
+                    break;
+                }
             }
-        }
         /* We did not get all the codec info, but we read too much data. */
         if (read_size >= probesize) {
             ret = count;
@@ -3461,7 +3767,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
                    "Probe buffer size limit of %"PRId64" bytes reached\n", probesize);
             for (i = 0; i < ic->nb_streams; i++)
                 if (!ic->streams[i]->r_frame_rate.num &&
-                    ic->streams[i]->info->duration_count <= 1 &&
+                    ic->streams[i]->internal->info->duration_count <= 1 &&
                     ic->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
                     strcmp(ic->iformat->name, "image2"))
                     av_log(ic, AV_LOG_WARNING,
@@ -3482,13 +3788,16 @@ FF_ENABLE_DEPRECATION_WARNINGS
             break;
         }
 
-        pkt = &pkt1;
-
         if (!(ic->flags & AVFMT_FLAG_NOBUFFER)) {
-            ret = add_to_pktbuf(&ic->internal->packet_buffer, pkt,
-                                &ic->internal->packet_buffer_end, 0);
+            ret = avpriv_packet_list_put(&ic->internal->packet_buffer,
+                                     &ic->internal->packet_buffer_end,
+                                     &pkt1, NULL, 0);
             if (ret < 0)
-                goto find_stream_info_err;
+                goto unref_then_goto_end;
+
+            pkt = &ic->internal->packet_buffer_end->pkt;
+        } else {
+            pkt = &pkt1;
         }
 
         st = ic->streams[pkt->stream_index];
@@ -3499,63 +3808,63 @@ FF_ENABLE_DEPRECATION_WARNINGS
         if (!st->internal->avctx_inited) {
             ret = avcodec_parameters_to_context(avctx, st->codecpar);
             if (ret < 0)
-                goto find_stream_info_err;
+                goto unref_then_goto_end;
             st->internal->avctx_inited = 1;
         }
 
         if (pkt->dts != AV_NOPTS_VALUE && st->codec_info_nb_frames > 1) {
             /* check for non-increasing dts */
-            if (st->info->fps_last_dts != AV_NOPTS_VALUE &&
-                st->info->fps_last_dts >= pkt->dts) {
+            if (st->internal->info->fps_last_dts != AV_NOPTS_VALUE &&
+                st->internal->info->fps_last_dts >= pkt->dts) {
                 av_log(ic, AV_LOG_DEBUG,
                        "Non-increasing DTS in stream %d: packet %d with DTS "
                        "%"PRId64", packet %d with DTS %"PRId64"\n",
-                       st->index, st->info->fps_last_dts_idx,
-                       st->info->fps_last_dts, st->codec_info_nb_frames,
+                       st->index, st->internal->info->fps_last_dts_idx,
+                       st->internal->info->fps_last_dts, st->codec_info_nb_frames,
                        pkt->dts);
-                st->info->fps_first_dts =
-                st->info->fps_last_dts  = AV_NOPTS_VALUE;
+                st->internal->info->fps_first_dts =
+                st->internal->info->fps_last_dts  = AV_NOPTS_VALUE;
             }
             /* Check for a discontinuity in dts. If the difference in dts
              * is more than 1000 times the average packet duration in the
              * sequence, we treat it as a discontinuity. */
-            if (st->info->fps_last_dts != AV_NOPTS_VALUE &&
-                st->info->fps_last_dts_idx > st->info->fps_first_dts_idx &&
-                (pkt->dts - st->info->fps_last_dts) / 1000 >
-                (st->info->fps_last_dts     - st->info->fps_first_dts) /
-                (st->info->fps_last_dts_idx - st->info->fps_first_dts_idx)) {
+            if (st->internal->info->fps_last_dts != AV_NOPTS_VALUE &&
+                st->internal->info->fps_last_dts_idx > st->internal->info->fps_first_dts_idx &&
+                (pkt->dts - (uint64_t)st->internal->info->fps_last_dts) / 1000 >
+                (st->internal->info->fps_last_dts     - (uint64_t)st->internal->info->fps_first_dts) /
+                (st->internal->info->fps_last_dts_idx - st->internal->info->fps_first_dts_idx)) {
                 av_log(ic, AV_LOG_WARNING,
                        "DTS discontinuity in stream %d: packet %d with DTS "
                        "%"PRId64", packet %d with DTS %"PRId64"\n",
-                       st->index, st->info->fps_last_dts_idx,
-                       st->info->fps_last_dts, st->codec_info_nb_frames,
+                       st->index, st->internal->info->fps_last_dts_idx,
+                       st->internal->info->fps_last_dts, st->codec_info_nb_frames,
                        pkt->dts);
-                st->info->fps_first_dts =
-                st->info->fps_last_dts  = AV_NOPTS_VALUE;
+                st->internal->info->fps_first_dts =
+                st->internal->info->fps_last_dts  = AV_NOPTS_VALUE;
             }
 
             /* update stored dts values */
-            if (st->info->fps_first_dts == AV_NOPTS_VALUE) {
-                st->info->fps_first_dts     = pkt->dts;
-                st->info->fps_first_dts_idx = st->codec_info_nb_frames;
+            if (st->internal->info->fps_first_dts == AV_NOPTS_VALUE) {
+                st->internal->info->fps_first_dts     = pkt->dts;
+                st->internal->info->fps_first_dts_idx = st->codec_info_nb_frames;
             }
-            st->info->fps_last_dts     = pkt->dts;
-            st->info->fps_last_dts_idx = st->codec_info_nb_frames;
+            st->internal->info->fps_last_dts     = pkt->dts;
+            st->internal->info->fps_last_dts_idx = st->codec_info_nb_frames;
         }
         if (st->codec_info_nb_frames>1) {
             int64_t t = 0;
             int64_t limit;
 
             if (st->time_base.den > 0)
-                t = av_rescale_q(st->info->codec_info_duration, st->time_base, AV_TIME_BASE_Q);
+                t = av_rescale_q(st->internal->info->codec_info_duration, st->time_base, AV_TIME_BASE_Q);
             if (st->avg_frame_rate.num > 0)
                 t = FFMAX(t, av_rescale_q(st->codec_info_nb_frames, av_inv_q(st->avg_frame_rate), AV_TIME_BASE_Q));
 
             if (   t == 0
                 && st->codec_info_nb_frames>30
-                && st->info->fps_first_dts != AV_NOPTS_VALUE
-                && st->info->fps_last_dts  != AV_NOPTS_VALUE)
-                t = FFMAX(t, av_rescale_q(st->info->fps_last_dts - st->info->fps_first_dts, st->time_base, AV_TIME_BASE_Q));
+                && st->internal->info->fps_first_dts != AV_NOPTS_VALUE
+                && st->internal->info->fps_last_dts  != AV_NOPTS_VALUE)
+                t = FFMAX(t, av_rescale_q(st->internal->info->fps_last_dts - st->internal->info->fps_first_dts, st->time_base, AV_TIME_BASE_Q));
 
             if (analyzed_all_streams)                                limit = max_analyze_duration;
             else if (avctx->codec_type == AVMEDIA_TYPE_SUBTITLE) limit = max_subtitle_analyze_duration;
@@ -3566,32 +3875,28 @@ FF_ENABLE_DEPRECATION_WARNINGS
                        limit,
                        t, pkt->stream_index);
                 if (ic->flags & AVFMT_FLAG_NOBUFFER)
-                    av_packet_unref(pkt);
+                    av_packet_unref(&pkt1);
                 break;
             }
             if (pkt->duration) {
-                if (avctx->codec_type == AVMEDIA_TYPE_SUBTITLE && pkt->pts != AV_NOPTS_VALUE && pkt->pts >= st->start_time) {
-                    st->info->codec_info_duration = FFMIN(pkt->pts - st->start_time, st->info->codec_info_duration + pkt->duration);
+                if (avctx->codec_type == AVMEDIA_TYPE_SUBTITLE && pkt->pts != AV_NOPTS_VALUE && st->start_time != AV_NOPTS_VALUE && pkt->pts >= st->start_time) {
+                    st->internal->info->codec_info_duration = FFMIN(pkt->pts - st->start_time, st->internal->info->codec_info_duration + pkt->duration);
                 } else
-                    st->info->codec_info_duration += pkt->duration;
-                st->info->codec_info_duration_fields += st->parser && st->need_parsing && avctx->ticks_per_frame ==2 ? st->parser->repeat_pict + 1 : 2;
+                    st->internal->info->codec_info_duration += pkt->duration;
+                st->internal->info->codec_info_duration_fields += st->parser && st->need_parsing && avctx->ticks_per_frame ==2 ? st->parser->repeat_pict + 1 : 2;
             }
         }
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
 #if FF_API_R_FRAME_RATE
-        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
             ff_rfps_add_frame(ic, st, pkt->dts);
 #endif
-        if (st->parser && st->parser->parser->split && !avctx->extradata) {
-            int i = st->parser->parser->split(avctx, pkt->data, pkt->size);
-            if (i > 0 && i < FF_MAX_EXTRADATA_SIZE) {
-                avctx->extradata_size = i;
-                avctx->extradata      = av_mallocz(avctx->extradata_size +
-                                                   AV_INPUT_BUFFER_PADDING_SIZE);
-                if (!avctx->extradata)
-                    return AVERROR(ENOMEM);
-                memcpy(avctx->extradata, pkt->data,
-                       avctx->extradata_size);
-            }
+            if (pkt->dts != pkt->pts && pkt->dts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
+                st->internal->info->frame_delay_evidence = 1;
+        }
+        if (!st->internal->avctx->extradata) {
+            ret = extract_extradata(st, pkt);
+            if (ret < 0)
+                goto unref_then_goto_end;
         }
 
         /* If still no information, we try to open the codec and to
@@ -3607,7 +3912,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
                          (options && i < orig_nb_streams) ? &options[i] : NULL);
 
         if (ic->flags & AVFMT_FLAG_NOBUFFER)
-            av_packet_unref(pkt);
+            av_packet_unref(&pkt1);
 
         st->codec_info_nb_frames++;
         count++;
@@ -3619,11 +3924,15 @@ FF_ENABLE_DEPRECATION_WARNINGS
             st = ic->streams[stream_index];
             avctx = st->internal->avctx;
             if (!has_codec_parameters(st, NULL)) {
-                const AVCodec *codec = find_decoder(ic, st, st->codecpar->codec_id);
+                const AVCodec *codec = find_probe_decoder(ic, st, st->codecpar->codec_id);
                 if (codec && !avctx->codec) {
-                    if (avcodec_open2(avctx, codec, (options && stream_index < orig_nb_streams) ? &options[stream_index] : NULL) < 0)
+                    AVDictionary *opts = NULL;
+                    if (ic->codec_whitelist)
+                        av_dict_set(&opts, "codec_whitelist", ic->codec_whitelist, 0);
+                    if (avcodec_open2(avctx, codec, (options && stream_index < orig_nb_streams) ? &options[stream_index] : &opts) < 0)
                         av_log(ic, AV_LOG_WARNING,
-                            "Failed to open codec in av_find_stream_info\n");
+                               "Failed to open codec in %s\n",__FUNCTION__);
+                    av_dict_free(&opts);
                 }
             }
 
@@ -3645,7 +3954,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
             st = ic->streams[i];
 
             /* flush the decoders */
-            if (st->info->found_decoder == 1) {
+            if (st->internal->info->found_decoder == 1) {
                 do {
                     err = try_decode_frame(ic, st, &empty_pkt,
                                             (options && i < orig_nb_streams)
@@ -3658,12 +3967,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
                 }
             }
         }
-    }
-
-    // close codecs which were opened in try_decode_frame()
-    for (i = 0; i < ic->nb_streams; i++) {
-        st = ic->streams[i];
-        avcodec_close(st->internal->avctx);
     }
 
     ff_rfps_calculate(ic);
@@ -3679,19 +3982,20 @@ FF_ENABLE_DEPRECATION_WARNINGS
             }
 
             /* estimate average framerate if not set by demuxer */
-            if (st->info->codec_info_duration_fields &&
+            if (st->internal->info->codec_info_duration_fields &&
                 !st->avg_frame_rate.num &&
-                st->info->codec_info_duration) {
+                st->internal->info->codec_info_duration) {
                 int best_fps      = 0;
                 double best_error = 0.01;
+                AVRational codec_frame_rate = avctx->framerate;
 
-                if (st->info->codec_info_duration        >= INT64_MAX / st->time_base.num / 2||
-                    st->info->codec_info_duration_fields >= INT64_MAX / st->time_base.den ||
-                    st->info->codec_info_duration        < 0)
+                if (st->internal->info->codec_info_duration        >= INT64_MAX / st->time_base.num / 2||
+                    st->internal->info->codec_info_duration_fields >= INT64_MAX / st->time_base.den ||
+                    st->internal->info->codec_info_duration        < 0)
                     continue;
                 av_reduce(&st->avg_frame_rate.num, &st->avg_frame_rate.den,
-                          st->info->codec_info_duration_fields * (int64_t) st->time_base.den,
-                          st->info->codec_info_duration * 2 * (int64_t) st->time_base.num, 60000);
+                          st->internal->info->codec_info_duration_fields * (int64_t) st->time_base.den,
+                          st->internal->info->codec_info_duration * 2 * (int64_t) st->time_base.num, 60000);
 
                 /* Round guessed framerate to a "standard" framerate if it's
                  * within 1% of the original estimate. */
@@ -3704,6 +4008,15 @@ FF_ENABLE_DEPRECATION_WARNINGS
                         best_error = error;
                         best_fps   = std_fps.num;
                     }
+
+                    if (ic->internal->prefer_codec_framerate && codec_frame_rate.num > 0 && codec_frame_rate.den > 0) {
+                        error       = fabs(av_q2d(codec_frame_rate) /
+                                           av_q2d(std_fps) - 1);
+                        if (error < best_error) {
+                            best_error = error;
+                            best_fps   = std_fps.num;
+                        }
+                    }
                 }
                 if (best_fps)
                     av_reduce(&st->avg_frame_rate.num, &st->avg_frame_rate.den,
@@ -3712,17 +4025,17 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
             if (!st->r_frame_rate.num) {
                 if (    avctx->time_base.den * (int64_t) st->time_base.num
-                    <= avctx->time_base.num * avctx->ticks_per_frame * (int64_t) st->time_base.den) {
-                    st->r_frame_rate.num = avctx->time_base.den;
-                    st->r_frame_rate.den = avctx->time_base.num * avctx->ticks_per_frame;
+                    <= avctx->time_base.num * avctx->ticks_per_frame * (uint64_t) st->time_base.den) {
+                    av_reduce(&st->r_frame_rate.num, &st->r_frame_rate.den,
+                              avctx->time_base.den, (int64_t)avctx->time_base.num * avctx->ticks_per_frame, INT_MAX);
                 } else {
                     st->r_frame_rate.num = st->time_base.den;
                     st->r_frame_rate.den = st->time_base.num;
                 }
             }
-            if (st->display_aspect_ratio.num && st->display_aspect_ratio.den) {
+            if (st->internal->display_aspect_ratio.num && st->internal->display_aspect_ratio.den) {
                 AVRational hw_ratio = { avctx->height, avctx->width };
-                st->sample_aspect_ratio = av_mul_q(st->display_aspect_ratio,
+                st->sample_aspect_ratio = av_mul_q(st->internal->display_aspect_ratio,
                                                    hw_ratio);
             }
         } else if (avctx->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -3776,14 +4089,16 @@ FF_ENABLE_DEPRECATION_WARNINGS
             avcodec_string(buf, sizeof(buf), st->internal->avctx, 0);
             av_log(ic, AV_LOG_WARNING,
                    "Could not find codec parameters for stream %d (%s): %s\n"
-                   "Consider increasing the value for the 'analyzeduration' and 'probesize' options\n",
-                   i, buf, errmsg);
+                   "Consider increasing the value for the 'analyzeduration' (%"PRId64") and 'probesize' (%"PRId64") options\n",
+                   i, buf, errmsg, ic->max_analyze_duration, ic->probesize);
         } else {
             ret = 0;
         }
     }
 
-    compute_chapters_end(ic);
+    ret = compute_chapters_end(ic);
+    if (ret < 0)
+        goto find_stream_info_err;
 
     /* update the stream parameters from the internal codec contexts */
     for (i = 0; i < ic->nb_streams; i++) {
@@ -3795,11 +4110,16 @@ FF_ENABLE_DEPRECATION_WARNINGS
             ret = avcodec_parameters_from_context(st->codecpar, st->internal->avctx);
             if (ret < 0)
                 goto find_stream_info_err;
+            ret = add_coded_side_data(st, st->internal->avctx);
+            if (ret < 0)
+                goto find_stream_info_err;
+#if FF_API_LOWRES
             // The decoder might reduce the video size by the lowres factor.
-            if (av_codec_get_lowres(st->internal->avctx) && orig_w) {
+            if (st->internal->avctx->lowres && orig_w) {
                 st->codecpar->width = orig_w;
                 st->codecpar->height = orig_h;
             }
+#endif
         }
 
 #if FF_API_LAVF_AVCTX
@@ -3808,16 +4128,20 @@ FF_DISABLE_DEPRECATION_WARNINGS
         if (ret < 0)
             goto find_stream_info_err;
 
+#if FF_API_LOWRES
         // The old API (AVStream.codec) "requires" the resolution to be adjusted
         // by the lowres factor.
-        if (av_codec_get_lowres(st->internal->avctx) && st->internal->avctx->width) {
-            av_codec_set_lowres(st->codec, av_codec_get_lowres(st->internal->avctx));
+        if (st->internal->avctx->lowres && st->internal->avctx->width) {
+            st->codec->lowres = st->internal->avctx->lowres;
             st->codec->width = st->internal->avctx->width;
             st->codec->height = st->internal->avctx->height;
         }
+#endif
 
-        if (st->codec->codec_tag != MKTAG('t','m','c','d'))
+        if (st->codec->codec_tag != MKTAG('t','m','c','d')) {
             st->codec->time_base = st->internal->avctx->time_base;
+            st->codec->ticks_per_frame = st->internal->avctx->ticks_per_frame;
+        }
         st->codec->framerate = st->avg_frame_rate;
 
         if (st->internal->avctx->subtitle_header) {
@@ -3842,14 +4166,21 @@ FF_ENABLE_DEPRECATION_WARNINGS
 find_stream_info_err:
     for (i = 0; i < ic->nb_streams; i++) {
         st = ic->streams[i];
-        if (st->info)
-            av_freep(&st->info->duration_error);
-        av_freep(&ic->streams[i]->info);
+        if (st->internal->info)
+            av_freep(&st->internal->info->duration_error);
+        avcodec_close(ic->streams[i]->internal->avctx);
+        av_freep(&ic->streams[i]->internal->info);
+        av_bsf_free(&ic->streams[i]->internal->extract_extradata.bsf);
+        av_packet_free(&ic->streams[i]->internal->extract_extradata.pkt);
     }
     if (ic->pb)
         av_log(ic, AV_LOG_DEBUG, "After avformat_find_stream_info() pos: %"PRId64" bytes read:%"PRId64" seeks:%d frames:%d\n",
                avio_tell(ic->pb), ic->pb->bytes_read, ic->pb->seek_count, count);
     return ret;
+
+unref_then_goto_end:
+    av_packet_unref(&pkt1);
+    goto find_stream_info_err;
 }
 
 AVProgram *av_find_program_from_stream(AVFormatContext *ic, AVProgram *last, int s)
@@ -3874,7 +4205,11 @@ int av_find_best_stream(AVFormatContext *ic, enum AVMediaType type,
                         AVCodec **decoder_ret, int flags)
 {
     int i, nb_streams = ic->nb_streams;
-    int ret = AVERROR_STREAM_NOT_FOUND, best_count = -1, best_bitrate = -1, best_multiframe = -1, count, bitrate, multiframe;
+    int ret = AVERROR_STREAM_NOT_FOUND;
+    int best_count = -1, best_multiframe = -1, best_disposition = -1;
+    int count, multiframe, disposition;
+    int64_t best_bitrate = -1;
+    int64_t bitrate;
     unsigned *program = NULL;
     const AVCodec *decoder = NULL, *best_decoder = NULL;
 
@@ -3893,10 +4228,6 @@ int av_find_best_stream(AVFormatContext *ic, enum AVMediaType type,
             continue;
         if (wanted_stream_nb >= 0 && real_stream_index != wanted_stream_nb)
             continue;
-        if (wanted_stream_nb != real_stream_index &&
-            st->disposition & (AV_DISPOSITION_HEARING_IMPAIRED |
-                               AV_DISPOSITION_VISUAL_IMPAIRED))
-            continue;
         if (type == AVMEDIA_TYPE_AUDIO && !(par->channels && par->sample_rate))
             continue;
         if (decoder_ret) {
@@ -3907,13 +4238,17 @@ int av_find_best_stream(AVFormatContext *ic, enum AVMediaType type,
                 continue;
             }
         }
+        disposition = !(st->disposition & (AV_DISPOSITION_HEARING_IMPAIRED | AV_DISPOSITION_VISUAL_IMPAIRED))
+                      + !! (st->disposition & AV_DISPOSITION_DEFAULT);
         count = st->codec_info_nb_frames;
         bitrate = par->bit_rate;
         multiframe = FFMIN(5, count);
-        if ((best_multiframe >  multiframe) ||
-            (best_multiframe == multiframe && best_bitrate >  bitrate) ||
-            (best_multiframe == multiframe && best_bitrate == bitrate && best_count >= count))
+        if ((best_disposition >  disposition) ||
+            (best_disposition == disposition && best_multiframe >  multiframe) ||
+            (best_disposition == disposition && best_multiframe == multiframe && best_bitrate >  bitrate) ||
+            (best_disposition == disposition && best_multiframe == multiframe && best_bitrate == bitrate && best_count >= count))
             continue;
+        best_disposition = disposition;
         best_count   = count;
         best_bitrate = bitrate;
         best_multiframe = multiframe;
@@ -3951,6 +4286,67 @@ int av_read_pause(AVFormatContext *s)
     return AVERROR(ENOSYS);
 }
 
+int ff_stream_encode_params_copy(AVStream *dst, const AVStream *src)
+{
+    int ret, i;
+
+    dst->id                  = src->id;
+    dst->time_base           = src->time_base;
+    dst->nb_frames           = src->nb_frames;
+    dst->disposition         = src->disposition;
+    dst->sample_aspect_ratio = src->sample_aspect_ratio;
+    dst->avg_frame_rate      = src->avg_frame_rate;
+    dst->r_frame_rate        = src->r_frame_rate;
+
+    av_dict_free(&dst->metadata);
+    ret = av_dict_copy(&dst->metadata, src->metadata, 0);
+    if (ret < 0)
+        return ret;
+
+    ret = avcodec_parameters_copy(dst->codecpar, src->codecpar);
+    if (ret < 0)
+        return ret;
+
+    /* Free existing side data*/
+    for (i = 0; i < dst->nb_side_data; i++)
+        av_free(dst->side_data[i].data);
+    av_freep(&dst->side_data);
+    dst->nb_side_data = 0;
+
+    /* Copy side data if present */
+    if (src->nb_side_data) {
+        dst->side_data = av_mallocz_array(src->nb_side_data,
+                                          sizeof(AVPacketSideData));
+        if (!dst->side_data)
+            return AVERROR(ENOMEM);
+        dst->nb_side_data = src->nb_side_data;
+
+        for (i = 0; i < src->nb_side_data; i++) {
+            uint8_t *data = av_memdup(src->side_data[i].data,
+                                      src->side_data[i].size);
+            if (!data)
+                return AVERROR(ENOMEM);
+            dst->side_data[i].type = src->side_data[i].type;
+            dst->side_data[i].size = src->side_data[i].size;
+            dst->side_data[i].data = data;
+        }
+    }
+
+#if FF_API_LAVF_FFSERVER
+FF_DISABLE_DEPRECATION_WARNINGS
+    av_freep(&dst->recommended_encoder_configuration);
+    if (src->recommended_encoder_configuration) {
+        const char *conf_str = src->recommended_encoder_configuration;
+        dst->recommended_encoder_configuration = av_strdup(conf_str);
+        if (!dst->recommended_encoder_configuration)
+            return AVERROR(ENOMEM);
+    }
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+
+    return 0;
+}
+
 static void free_stream(AVStream **pst)
 {
     AVStream *st = *pst;
@@ -3971,30 +4367,33 @@ static void free_stream(AVStream **pst)
 
     if (st->internal) {
         avcodec_free_context(&st->internal->avctx);
-        for (i = 0; i < st->internal->nb_bsfcs; i++) {
-            av_bsf_free(&st->internal->bsfcs[i]);
-            av_freep(&st->internal->bsfcs);
-        }
+        av_bsf_free(&st->internal->bsfc);
+        av_freep(&st->internal->priv_pts);
+        av_freep(&st->internal->index_entries);
+        av_freep(&st->internal->probe_data.buf);
+
+        av_bsf_free(&st->internal->extract_extradata.bsf);
+        av_packet_free(&st->internal->extract_extradata.pkt);
+
+        if (st->internal->info)
+            av_freep(&st->internal->info->duration_error);
+        av_freep(&st->internal->info);
     }
     av_freep(&st->internal);
 
     av_dict_free(&st->metadata);
     avcodec_parameters_free(&st->codecpar);
-    av_freep(&st->probe_data.buf);
-    av_freep(&st->index_entries);
 #if FF_API_LAVF_AVCTX
 FF_DISABLE_DEPRECATION_WARNINGS
-    av_freep(&st->codec->extradata);
-    av_freep(&st->codec->subtitle_header);
-    av_freep(&st->codec);
+    avcodec_free_context(&st->codec);
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
     av_freep(&st->priv_data);
-    if (st->info)
-        av_freep(&st->info->duration_error);
-    av_freep(&st->info);
+#if FF_API_LAVF_FFSERVER
+FF_DISABLE_DEPRECATION_WARNINGS
     av_freep(&st->recommended_encoder_configuration);
-    av_freep(&st->priv_pts);
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
 
     av_freep(pst);
 }
@@ -4014,21 +4413,26 @@ void avformat_free_context(AVFormatContext *s)
     if (!s)
         return;
 
+    if (s->oformat && s->oformat->deinit && s->internal->initialized)
+        s->oformat->deinit(s);
+
     av_opt_free(s);
     if (s->iformat && s->iformat->priv_class && s->priv_data)
         av_opt_free(s->priv_data);
     if (s->oformat && s->oformat->priv_class && s->priv_data)
         av_opt_free(s->priv_data);
 
-    for (i = s->nb_streams - 1; i >= 0; i--)
-        ff_free_stream(s, s->streams[i]);
+    for (i = 0; i < s->nb_streams; i++)
+        free_stream(&s->streams[i]);
+    s->nb_streams = 0;
 
-
-    for (i = s->nb_programs - 1; i >= 0; i--) {
+    for (i = 0; i < s->nb_programs; i++) {
         av_dict_free(&s->programs[i]->metadata);
         av_freep(&s->programs[i]->stream_index);
         av_freep(&s->programs[i]);
     }
+    s->nb_programs = 0;
+
     av_freep(&s->programs);
     av_freep(&s->priv_data);
     while (s->nb_chapters--) {
@@ -4037,9 +4441,11 @@ void avformat_free_context(AVFormatContext *s)
     }
     av_freep(&s->chapters);
     av_dict_free(&s->metadata);
+    av_dict_free(&s->internal->id3v2_meta);
     av_freep(&s->streams);
-    av_freep(&s->internal);
     flush_packet_queue(s);
+    av_freep(&s->internal);
+    av_freep(&s->url);
     av_free(s);
 }
 
@@ -4077,8 +4483,11 @@ AVStream *avformat_new_stream(AVFormatContext *s, const AVCodec *c)
     int i;
     AVStream **streams;
 
-    if (s->nb_streams >= INT_MAX/sizeof(*streams))
+    if (s->nb_streams >= FFMIN(s->max_streams, INT_MAX/sizeof(*streams))) {
+        if (s->max_streams < INT_MAX/sizeof(*streams))
+            av_log(s, AV_LOG_ERROR, "Number of streams exceeds max_streams parameter (%d), see the documentation if you wish to increase it\n", s->max_streams);
         return NULL;
+    }
     streams = av_realloc_array(s->streams, s->nb_streams + 1, sizeof(*streams));
     if (!streams)
         return NULL;
@@ -4087,17 +4496,11 @@ AVStream *avformat_new_stream(AVFormatContext *s, const AVCodec *c)
     st = av_mallocz(sizeof(AVStream));
     if (!st)
         return NULL;
-    if (!(st->info = av_mallocz(sizeof(*st->info)))) {
-        av_free(st);
-        return NULL;
-    }
-    st->info->last_dts = AV_NOPTS_VALUE;
 
 #if FF_API_LAVF_AVCTX
 FF_DISABLE_DEPRECATION_WARNINGS
     st->codec = avcodec_alloc_context3(c);
     if (!st->codec) {
-        av_free(st->info);
         av_free(st);
         return NULL;
     }
@@ -4107,6 +4510,11 @@ FF_ENABLE_DEPRECATION_WARNINGS
     st->internal = av_mallocz(sizeof(*st->internal));
     if (!st->internal)
         goto fail;
+
+    st->internal->info = av_mallocz(sizeof(*st->internal->info));
+    if (!st->internal->info)
+        goto fail;
+    st->internal->info->last_dts = AV_NOPTS_VALUE;
 
     st->codecpar = avcodec_parameters_alloc();
     if (!st->codecpar)
@@ -4139,24 +4547,24 @@ FF_ENABLE_DEPRECATION_WARNINGS
     st->start_time = AV_NOPTS_VALUE;
     st->duration   = AV_NOPTS_VALUE;
     st->first_dts     = AV_NOPTS_VALUE;
-    st->probe_packets = MAX_PROBE_PACKETS;
-    st->pts_wrap_reference = AV_NOPTS_VALUE;
-    st->pts_wrap_behavior = AV_PTS_WRAP_IGNORE;
+    st->probe_packets = s->max_probe_packets;
+    st->internal->pts_wrap_reference = AV_NOPTS_VALUE;
+    st->internal->pts_wrap_behavior = AV_PTS_WRAP_IGNORE;
 
     st->last_IP_pts = AV_NOPTS_VALUE;
-    st->last_dts_for_order_check = AV_NOPTS_VALUE;
+    st->internal->last_dts_for_order_check = AV_NOPTS_VALUE;
     for (i = 0; i < MAX_REORDER_DELAY + 1; i++)
-        st->pts_buffer[i] = AV_NOPTS_VALUE;
+        st->internal->pts_buffer[i] = AV_NOPTS_VALUE;
 
     st->sample_aspect_ratio = (AVRational) { 0, 1 };
 
 #if FF_API_R_FRAME_RATE
-    st->info->last_dts      = AV_NOPTS_VALUE;
+    st->internal->info->last_dts      = AV_NOPTS_VALUE;
 #endif
-    st->info->fps_first_dts = AV_NOPTS_VALUE;
-    st->info->fps_last_dts  = AV_NOPTS_VALUE;
+    st->internal->info->fps_first_dts = AV_NOPTS_VALUE;
+    st->internal->info->fps_last_dts  = AV_NOPTS_VALUE;
 
-    st->inject_global_side_data = s->internal->inject_global_side_data;
+    st->internal->inject_global_side_data = s->internal->inject_global_side_data;
 
     st->internal->need_context_update = 1;
 
@@ -4184,14 +4592,13 @@ AVProgram *av_new_program(AVFormatContext *ac, int id)
             return NULL;
         dynarray_add(&ac->programs, &ac->nb_programs, program);
         program->discard = AVDISCARD_NONE;
+        program->pmt_version = -1;
+        program->id = id;
+        program->pts_wrap_reference = AV_NOPTS_VALUE;
+        program->pts_wrap_behavior = AV_PTS_WRAP_IGNORE;
+        program->start_time =
+        program->end_time   = AV_NOPTS_VALUE;
     }
-    program->id = id;
-    program->pts_wrap_reference = AV_NOPTS_VALUE;
-    program->pts_wrap_behavior = AV_PTS_WRAP_IGNORE;
-
-    program->start_time =
-    program->end_time   = AV_NOPTS_VALUE;
-
     return program;
 }
 
@@ -4258,7 +4665,29 @@ uint64_t ff_ntp_time(void)
     return (av_gettime() / 1000) * 1000 + NTP_OFFSET_US;
 }
 
-int av_get_frame_filename(char *buf, int buf_size, const char *path, int number)
+uint64_t ff_get_formatted_ntp_time(uint64_t ntp_time_us)
+{
+    uint64_t ntp_ts, frac_part, sec;
+    uint32_t usec;
+
+    //current ntp time in seconds and micro seconds
+    sec = ntp_time_us / 1000000;
+    usec = ntp_time_us % 1000000;
+
+    //encoding in ntp timestamp format
+    frac_part = usec * 0xFFFFFFFFULL;
+    frac_part /= 1000000;
+
+    if (sec > 0xFFFFFFFFULL)
+        av_log(NULL, AV_LOG_WARNING, "NTP time format roll over detected\n");
+
+    ntp_ts = sec << 32;
+    ntp_ts |= frac_part;
+
+    return ntp_ts;
+}
+
+int av_get_frame_filename2(char *buf, int buf_size, const char *path, int number, int flags)
 {
     const char *p;
     char *q, buf1[20], c;
@@ -4274,8 +4703,11 @@ int av_get_frame_filename(char *buf, int buf_size, const char *path, int number)
         if (c == '%') {
             do {
                 nd = 0;
-                while (av_isdigit(*p))
+                while (av_isdigit(*p)) {
+                    if (nd >= INT_MAX / 10 - 255)
+                        goto fail;
                     nd = nd * 10 + *p++ - '0';
+                }
                 c = *p++;
             } while (av_isdigit(c));
 
@@ -4283,7 +4715,7 @@ int av_get_frame_filename(char *buf, int buf_size, const char *path, int number)
             case '%':
                 goto addchar;
             case 'd':
-                if (percentd_found)
+                if (!(flags & AV_FRAME_FILENAME_FLAGS_MULTIPLE) && percentd_found)
                     goto fail;
                 percentd_found = 1;
                 if (number < 0)
@@ -4313,12 +4745,17 @@ fail:
     return -1;
 }
 
+int av_get_frame_filename(char *buf, int buf_size, const char *path, int number)
+{
+    return av_get_frame_filename2(buf, buf_size, path, number, 0);
+}
+
 void av_url_split(char *proto, int proto_size,
                   char *authorization, int authorization_size,
                   char *hostname, int hostname_size,
                   int *port_ptr, char *path, int path_size, const char *url)
 {
-    const char *p, *ls, *ls2, *at, *at2, *col, *brk;
+    const char *p, *ls, *at, *at2, *col, *brk;
 
     if (port_ptr)
         *port_ptr = -1;
@@ -4346,16 +4783,8 @@ void av_url_split(char *proto, int proto_size,
     }
 
     /* separate path from hostname */
-    ls = strchr(p, '/');
-    ls2 = strchr(p, '?');
-    if (!ls)
-        ls = ls2;
-    else if (ls && ls2)
-        ls = FFMIN(ls, ls2);
-    if (ls)
-        av_strlcpy(path, ls, path_size);
-    else
-        ls = &p[strlen(p)];  // XXX
+    ls = p + strcspn(p, "/?#");
+    av_strlcpy(path, ls, path_size);
 
     /* the rest is hostname, use that to parse auth/port */
     if (ls != p) {
@@ -4382,6 +4811,40 @@ void av_url_split(char *proto, int proto_size,
             av_strlcpy(hostname, p,
                        FFMIN(ls + 1 - p, hostname_size));
     }
+}
+
+int ff_mkdir_p(const char *path)
+{
+    int ret = 0;
+    char *temp = av_strdup(path);
+    char *pos = temp;
+    char tmp_ch = '\0';
+
+    if (!path || !temp) {
+        return -1;
+    }
+
+    if (!av_strncasecmp(temp, "/", 1) || !av_strncasecmp(temp, "\\", 1)) {
+        pos++;
+    } else if (!av_strncasecmp(temp, "./", 2) || !av_strncasecmp(temp, ".\\", 2)) {
+        pos += 2;
+    }
+
+    for ( ; *pos != '\0'; ++pos) {
+        if (*pos == '/' || *pos == '\\') {
+            tmp_ch = *pos;
+            *pos = '\0';
+            ret = mkdir(temp, 0755);
+            *pos = tmp_ch;
+        }
+    }
+
+    if ((*(pos - 1) != '/') || (*(pos - 1) != '\\')) {
+        ret = mkdir(temp, 0755);
+    }
+
+    av_free(temp);
+    return ret;
 }
 
 char *ff_data_to_hex(char *buff, const uint8_t *src, int s, int lowercase)
@@ -4456,10 +4919,10 @@ void avpriv_set_pts_info(AVStream *s, int pts_wrap_bits,
     s->time_base     = new_tb;
 #if FF_API_LAVF_AVCTX
 FF_DISABLE_DEPRECATION_WARNINGS
-    av_codec_set_pkt_timebase(s->codec, new_tb);
+    s->codec->pkt_timebase = new_tb;
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
-    av_codec_set_pkt_timebase(s->internal->avctx, new_tb);
+    s->internal->avctx->pkt_timebase = new_tb;
     s->pts_wrap_bits = pts_wrap_bits;
 }
 
@@ -4537,7 +5000,8 @@ int avformat_query_codec(const AVOutputFormat *ofmt, enum AVCodecID codec_id,
             return !!av_codec_get_tag2(ofmt->codec_tag, codec_id, &codec_tag);
         else if (codec_id == ofmt->video_codec ||
                  codec_id == ofmt->audio_codec ||
-                 codec_id == ofmt->subtitle_codec)
+                 codec_id == ofmt->subtitle_codec ||
+                 codec_id == ofmt->data_codec)
             return 1;
     }
     return AVERROR_PATCHWELCOME;
@@ -4547,7 +5011,6 @@ int avformat_network_init(void)
 {
 #if CONFIG_NETWORK
     int ret;
-    ff_network_inited_globally = 1;
     if ((ret = ff_network_init()) < 0)
         return ret;
     if ((ret = ff_tls_init()) < 0)
@@ -4561,7 +5024,6 @@ int avformat_network_deinit(void)
 #if CONFIG_NETWORK
     ff_network_close();
     ff_tls_deinit();
-    ff_network_inited_globally = 0;
 #endif
     return 0;
 }
@@ -4652,161 +5114,211 @@ AVRational av_guess_frame_rate(AVFormatContext *format, AVStream *st, AVFrame *f
     return fr;
 }
 
+/**
+ * Matches a stream specifier (but ignores requested index).
+ *
+ * @param indexptr set to point to the requested stream index if there is one
+ *
+ * @return <0 on error
+ *         0  if st is NOT a matching stream
+ *         >0 if st is a matching stream
+ */
+static int match_stream_specifier(AVFormatContext *s, AVStream *st,
+                                  const char *spec, const char **indexptr, AVProgram **p)
+{
+    int match = 1;                      /* Stores if the specifier matches so far. */
+    while (*spec) {
+        if (*spec <= '9' && *spec >= '0') { /* opt:index */
+            if (indexptr)
+                *indexptr = spec;
+            return match;
+        } else if (*spec == 'v' || *spec == 'a' || *spec == 's' || *spec == 'd' ||
+                   *spec == 't' || *spec == 'V') { /* opt:[vasdtV] */
+            enum AVMediaType type;
+            int nopic = 0;
+
+            switch (*spec++) {
+            case 'v': type = AVMEDIA_TYPE_VIDEO;      break;
+            case 'a': type = AVMEDIA_TYPE_AUDIO;      break;
+            case 's': type = AVMEDIA_TYPE_SUBTITLE;   break;
+            case 'd': type = AVMEDIA_TYPE_DATA;       break;
+            case 't': type = AVMEDIA_TYPE_ATTACHMENT; break;
+            case 'V': type = AVMEDIA_TYPE_VIDEO; nopic = 1; break;
+            default:  av_assert0(0);
+            }
+            if (*spec && *spec++ != ':')         /* If we are not at the end, then another specifier must follow. */
+                return AVERROR(EINVAL);
+
+#if FF_API_LAVF_AVCTX
+FF_DISABLE_DEPRECATION_WARNINGS
+            if (type != st->codecpar->codec_type
+               && (st->codecpar->codec_type != AVMEDIA_TYPE_UNKNOWN || st->codec->codec_type != type))
+                match = 0;
+    FF_ENABLE_DEPRECATION_WARNINGS
+#else
+            if (type != st->codecpar->codec_type)
+                match = 0;
+#endif
+            if (nopic && (st->disposition & AV_DISPOSITION_ATTACHED_PIC))
+                match = 0;
+        } else if (*spec == 'p' && *(spec + 1) == ':') {
+            int prog_id, i, j;
+            int found = 0;
+            char *endptr;
+            spec += 2;
+            prog_id = strtol(spec, &endptr, 0);
+            /* Disallow empty id and make sure that if we are not at the end, then another specifier must follow. */
+            if (spec == endptr || (*endptr && *endptr++ != ':'))
+                return AVERROR(EINVAL);
+            spec = endptr;
+            if (match) {
+                for (i = 0; i < s->nb_programs; i++) {
+                    if (s->programs[i]->id != prog_id)
+                        continue;
+
+                    for (j = 0; j < s->programs[i]->nb_stream_indexes; j++) {
+                        if (st->index == s->programs[i]->stream_index[j]) {
+                            found = 1;
+                            if (p)
+                                *p = s->programs[i];
+                            i = s->nb_programs;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!found)
+                match = 0;
+        } else if (*spec == '#' ||
+                   (*spec == 'i' && *(spec + 1) == ':')) {
+            int stream_id;
+            char *endptr;
+            spec += 1 + (*spec == 'i');
+            stream_id = strtol(spec, &endptr, 0);
+            if (spec == endptr || *endptr)                /* Disallow empty id and make sure we are at the end. */
+                return AVERROR(EINVAL);
+            return match && (stream_id == st->id);
+        } else if (*spec == 'm' && *(spec + 1) == ':') {
+            AVDictionaryEntry *tag;
+            char *key, *val;
+            int ret;
+
+            if (match) {
+               spec += 2;
+               val = strchr(spec, ':');
+
+               key = val ? av_strndup(spec, val - spec) : av_strdup(spec);
+               if (!key)
+                   return AVERROR(ENOMEM);
+
+               tag = av_dict_get(st->metadata, key, NULL, 0);
+               if (tag) {
+                   if (!val || !strcmp(tag->value, val + 1))
+                       ret = 1;
+                   else
+                       ret = 0;
+               } else
+                   ret = 0;
+
+               av_freep(&key);
+            }
+            return match && ret;
+        } else if (*spec == 'u' && *(spec + 1) == '\0') {
+            AVCodecParameters *par = st->codecpar;
+#if FF_API_LAVF_AVCTX
+FF_DISABLE_DEPRECATION_WARNINGS
+            AVCodecContext *codec = st->codec;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+            int val;
+            switch (par->codec_type) {
+            case AVMEDIA_TYPE_AUDIO:
+                val = par->sample_rate && par->channels;
+#if FF_API_LAVF_AVCTX
+                val = val || (codec->sample_rate && codec->channels);
+#endif
+                if (par->format == AV_SAMPLE_FMT_NONE
+#if FF_API_LAVF_AVCTX
+                    && codec->sample_fmt == AV_SAMPLE_FMT_NONE
+#endif
+                    )
+                    return 0;
+                break;
+            case AVMEDIA_TYPE_VIDEO:
+                val = par->width && par->height;
+#if FF_API_LAVF_AVCTX
+                val = val || (codec->width && codec->height);
+#endif
+                if (par->format == AV_PIX_FMT_NONE
+#if FF_API_LAVF_AVCTX
+                    && codec->pix_fmt == AV_PIX_FMT_NONE
+#endif
+                    )
+                    return 0;
+                break;
+            case AVMEDIA_TYPE_UNKNOWN:
+                val = 0;
+                break;
+            default:
+                val = 1;
+                break;
+            }
+#if FF_API_LAVF_AVCTX
+            return match && ((par->codec_id != AV_CODEC_ID_NONE || codec->codec_id != AV_CODEC_ID_NONE) && val != 0);
+#else
+            return match && (par->codec_id != AV_CODEC_ID_NONE && val != 0);
+#endif
+        } else {
+            return AVERROR(EINVAL);
+        }
+    }
+
+    return match;
+}
+
+
 int avformat_match_stream_specifier(AVFormatContext *s, AVStream *st,
                                     const char *spec)
 {
-    if (*spec <= '9' && *spec >= '0') /* opt:index */
-        return strtol(spec, NULL, 0) == st->index;
-    else if (*spec == 'v' || *spec == 'a' || *spec == 's' || *spec == 'd' ||
-             *spec == 't' || *spec == 'V') { /* opt:[vasdtV] */
-        enum AVMediaType type;
-        int nopic = 0;
+    int ret, index;
+    char *endptr;
+    const char *indexptr = NULL;
+    AVProgram *p = NULL;
+    int nb_streams;
 
-        switch (*spec++) {
-        case 'v': type = AVMEDIA_TYPE_VIDEO;      break;
-        case 'a': type = AVMEDIA_TYPE_AUDIO;      break;
-        case 's': type = AVMEDIA_TYPE_SUBTITLE;   break;
-        case 'd': type = AVMEDIA_TYPE_DATA;       break;
-        case 't': type = AVMEDIA_TYPE_ATTACHMENT; break;
-        case 'V': type = AVMEDIA_TYPE_VIDEO; nopic = 1; break;
-        default:  av_assert0(0);
-        }
-#if FF_API_LAVF_AVCTX
-FF_DISABLE_DEPRECATION_WARNINGS
-        if (type != st->codecpar->codec_type
-           && (st->codecpar->codec_type != AVMEDIA_TYPE_UNKNOWN || st->codec->codec_type != type))
-            return 0;
-FF_ENABLE_DEPRECATION_WARNINGS
-#else
-        if (type != st->codecpar->codec_type)
-            return 0;
-#endif
-        if (nopic && (st->disposition & AV_DISPOSITION_ATTACHED_PIC))
-            return 0;
-        if (*spec++ == ':') { /* possibly followed by :index */
-            int i, index = strtol(spec, NULL, 0);
-            for (i = 0; i < s->nb_streams; i++) {
-#if FF_API_LAVF_AVCTX
-FF_DISABLE_DEPRECATION_WARNINGS
-                if ((s->streams[i]->codecpar->codec_type == type
-                      || s->streams[i]->codec->codec_type == type
-                    ) &&
-                    !(nopic && (st->disposition & AV_DISPOSITION_ATTACHED_PIC)) &&
-                    index-- == 0)
-                    return i == st->index;
-FF_ENABLE_DEPRECATION_WARNINGS
-#else
-                if ((s->streams[i]->codecpar->codec_type == type) &&
-                    !(nopic && (st->disposition & AV_DISPOSITION_ATTACHED_PIC)) &&
-                    index-- == 0)
-                    return i == st->index;
-#endif
-            }
-            return 0;
-        }
-        return 1;
-    } else if (*spec == 'p' && *(spec + 1) == ':') {
-        int prog_id, i, j;
-        char *endptr;
-        spec += 2;
-        prog_id = strtol(spec, &endptr, 0);
-        for (i = 0; i < s->nb_programs; i++) {
-            if (s->programs[i]->id != prog_id)
-                continue;
+    ret = match_stream_specifier(s, st, spec, &indexptr, &p);
+    if (ret < 0)
+        goto error;
 
-            if (*endptr++ == ':') {
-                int stream_idx = strtol(endptr, NULL, 0);
-                return stream_idx >= 0 &&
-                    stream_idx < s->programs[i]->nb_stream_indexes &&
-                    st->index == s->programs[i]->stream_index[stream_idx];
-            }
-
-            for (j = 0; j < s->programs[i]->nb_stream_indexes; j++)
-                if (st->index == s->programs[i]->stream_index[j])
-                    return 1;
-        }
-        return 0;
-    } else if (*spec == '#' ||
-               (*spec == 'i' && *(spec + 1) == ':')) {
-        int stream_id;
-        char *endptr;
-        spec += 1 + (*spec == 'i');
-        stream_id = strtol(spec, &endptr, 0);
-        if (!*endptr)
-            return stream_id == st->id;
-    } else if (*spec == 'm' && *(spec + 1) == ':') {
-        AVDictionaryEntry *tag;
-        char *key, *val;
-        int ret;
-
-        spec += 2;
-        val = strchr(spec, ':');
-
-        key = val ? av_strndup(spec, val - spec) : av_strdup(spec);
-        if (!key)
-            return AVERROR(ENOMEM);
-
-        tag = av_dict_get(st->metadata, key, NULL, 0);
-        if (tag) {
-            if (!val || !strcmp(tag->value, val + 1))
-                ret = 1;
-            else
-                ret = 0;
-        } else
-            ret = 0;
-
-        av_freep(&key);
+    if (!indexptr)
         return ret;
-    } else if (*spec == 'u') {
-        AVCodecParameters *par = st->codecpar;
-#if FF_API_LAVF_AVCTX
-FF_DISABLE_DEPRECATION_WARNINGS
-        AVCodecContext *codec = st->codec;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-        int val;
-        switch (par->codec_type) {
-        case AVMEDIA_TYPE_AUDIO:
-            val = par->sample_rate && par->channels;
-#if FF_API_LAVF_AVCTX
-            val = val || (codec->sample_rate && codec->channels);
-#endif
-            if (par->format == AV_SAMPLE_FMT_NONE
-#if FF_API_LAVF_AVCTX
-                && codec->sample_fmt == AV_SAMPLE_FMT_NONE
-#endif
-                )
-                return 0;
-            break;
-        case AVMEDIA_TYPE_VIDEO:
-            val = par->width && par->height;
-#if FF_API_LAVF_AVCTX
-            val = val || (codec->width && codec->height);
-#endif
-            if (par->format == AV_PIX_FMT_NONE
-#if FF_API_LAVF_AVCTX
-                && codec->pix_fmt == AV_PIX_FMT_NONE
-#endif
-                )
-                return 0;
-            break;
-        case AVMEDIA_TYPE_UNKNOWN:
-            val = 0;
-            break;
-        default:
-            val = 1;
-            break;
-        }
-#if FF_API_LAVF_AVCTX
-        return (par->codec_id != AV_CODEC_ID_NONE || codec->codec_id != AV_CODEC_ID_NONE) && val != 0;
-#else
-        return par->codec_id != AV_CODEC_ID_NONE && val != 0;
-#endif
-    } else if (!*spec) /* empty specifier, matches everything */
-        return 1;
 
-    av_log(s, AV_LOG_ERROR, "Invalid stream specifier: %s.\n", spec);
-    return AVERROR(EINVAL);
+    index = strtol(indexptr, &endptr, 0);
+    if (*endptr) {                  /* We can't have anything after the requested index. */
+        ret = AVERROR(EINVAL);
+        goto error;
+    }
+
+    /* This is not really needed but saves us a loop for simple stream index specifiers. */
+    if (spec == indexptr)
+        return (index == st->index);
+
+    /* If we requested a matching stream index, we have to ensure st is that. */
+    nb_streams = p ? p->nb_stream_indexes : s->nb_streams;
+    for (int i = 0; i < nb_streams && index >= 0; i++) {
+        AVStream *candidate = p ? s->streams[p->stream_index[i]] : s->streams[i];
+        ret = match_stream_specifier(s, candidate, spec, NULL, NULL);
+        if (ret < 0)
+            goto error;
+        if (ret > 0 && index-- == 0 && st == candidate)
+            return 1;
+    }
+    return 0;
+
+error:
+    if (ret == AVERROR(EINVAL))
+        av_log(s, AV_LOG_ERROR, "Invalid stream specifier: %s.\n", spec);
+    return ret;
 }
 
 int ff_generate_avci_extradata(AVStream *st)
@@ -4908,7 +5420,7 @@ int ff_generate_avci_extradata(AVStream *st)
     };
 
     const uint8_t *data = NULL;
-    int size            = 0;
+    int ret, size       = 0;
 
     if (st->codecpar->width == 1920) {
         if (st->codecpar->field_order == AV_FIELD_PROGRESSIVE) {
@@ -4937,16 +5449,15 @@ int ff_generate_avci_extradata(AVStream *st)
     if (!size)
         return 0;
 
-    av_freep(&st->codecpar->extradata);
-    if (ff_alloc_extradata(st->codecpar, size))
-        return AVERROR(ENOMEM);
+    if ((ret = ff_alloc_extradata(st->codecpar, size)) < 0)
+        return ret;
     memcpy(st->codecpar->extradata, data, size);
 
     return 0;
 }
 
-uint8_t *av_stream_get_side_data(AVStream *st, enum AVPacketSideDataType type,
-                                 int *size)
+uint8_t *av_stream_get_side_data(const AVStream *st,
+                                 enum AVPacketSideDataType type, int *size)
 {
     int i;
 
@@ -4957,18 +5468,16 @@ uint8_t *av_stream_get_side_data(AVStream *st, enum AVPacketSideDataType type,
             return st->side_data[i].data;
         }
     }
+    if (size)
+        *size = 0;
     return NULL;
 }
 
-uint8_t *av_stream_new_side_data(AVStream *st, enum AVPacketSideDataType type,
-                                 int size)
+int av_stream_add_side_data(AVStream *st, enum AVPacketSideDataType type,
+                            uint8_t *data, size_t size)
 {
     AVPacketSideData *sd, *tmp;
     int i;
-    uint8_t *data = av_malloc(size);
-
-    if (!data)
-        return NULL;
 
     for (i = 0; i < st->nb_side_data; i++) {
         sd = &st->side_data[i];
@@ -4977,14 +5486,16 @@ uint8_t *av_stream_new_side_data(AVStream *st, enum AVPacketSideDataType type,
             av_freep(&sd->data);
             sd->data = data;
             sd->size = size;
-            return sd->data;
+            return 0;
         }
     }
 
-    tmp = av_realloc_array(st->side_data, st->nb_side_data + 1, sizeof(*tmp));
+    if ((unsigned)st->nb_side_data + 1 >= INT_MAX / sizeof(*st->side_data))
+        return AVERROR(ERANGE);
+
+    tmp = av_realloc(st->side_data, (st->nb_side_data + 1) * sizeof(*tmp));
     if (!tmp) {
-        av_freep(&data);
-        return NULL;
+        return AVERROR(ENOMEM);
     }
 
     st->side_data = tmp;
@@ -4994,6 +5505,25 @@ uint8_t *av_stream_new_side_data(AVStream *st, enum AVPacketSideDataType type,
     sd->type = type;
     sd->data = data;
     sd->size = size;
+
+    return 0;
+}
+
+uint8_t *av_stream_new_side_data(AVStream *st, enum AVPacketSideDataType type,
+                                 int size)
+{
+    int ret;
+    uint8_t *data = av_malloc(size);
+
+    if (!data)
+        return NULL;
+
+    ret = av_stream_add_side_data(st, type, data, size);
+    if (ret < 0) {
+        av_freep(&data);
+        return NULL;
+    }
+
     return data;
 }
 
@@ -5002,7 +5532,8 @@ int ff_stream_add_bitstream_filter(AVStream *st, const char *name, const char *a
     int ret;
     const AVBitStreamFilter *bsf;
     AVBSFContext *bsfc;
-    AVCodecParameters *in_par;
+
+    av_assert0(!st->internal->bsfc);
 
     if (!(bsf = av_bsf_get_by_name(name))) {
         av_log(NULL, AV_LOG_ERROR, "Unknown bitstream filter '%s'\n", name);
@@ -5012,15 +5543,8 @@ int ff_stream_add_bitstream_filter(AVStream *st, const char *name, const char *a
     if ((ret = av_bsf_alloc(bsf, &bsfc)) < 0)
         return ret;
 
-    if (st->internal->nb_bsfcs) {
-        in_par = st->internal->bsfcs[st->internal->nb_bsfcs - 1]->par_out;
-        bsfc->time_base_in = st->internal->bsfcs[st->internal->nb_bsfcs - 1]->time_base_out;
-    } else {
-        in_par = st->codecpar;
-        bsfc->time_base_in = st->time_base;
-    }
-
-    if ((ret = avcodec_parameters_copy(bsfc->par_in, in_par)) < 0) {
+    bsfc->time_base_in = st->time_base;
+    if ((ret = avcodec_parameters_copy(bsfc->par_in, st->codecpar)) < 0) {
         av_bsf_free(&bsfc);
         return ret;
     }
@@ -5043,10 +5567,7 @@ int ff_stream_add_bitstream_filter(AVStream *st, const char *name, const char *a
         return ret;
     }
 
-    if ((ret = av_dynarray_add_nofree(&st->internal->bsfcs, &st->internal->nb_bsfcs, bsfc))) {
-        av_bsf_free(&bsfc);
-        return ret;
-    }
+    st->internal->bsfc = bsfc;
 
     av_log(NULL, AV_LOG_VERBOSE,
            "Automatically inserted bitstream filter '%s'; args='%s'\n",
@@ -5112,11 +5633,26 @@ int av_apply_bitstream_filters(AVCodecContext *codec, AVPacket *pkt,
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
 
+int ff_format_output_open(AVFormatContext *s, const char *url, AVDictionary **options)
+{
+    if (!s->oformat)
+        return AVERROR(EINVAL);
+
+    if (!(s->oformat->flags & AVFMT_NOFILE))
+        return s->io_open(s, &s->pb, url, AVIO_FLAG_WRITE, options);
+    return 0;
+}
+
 void ff_format_io_close(AVFormatContext *s, AVIOContext **pb)
 {
     if (*pb)
         s->io_close(s, *pb);
     *pb = NULL;
+}
+
+int ff_is_http_proto(char *filename) {
+    const char *proto = avio_find_protocol_name(filename);
+    return proto ? (!av_strcasecmp(proto, "http") || !av_strcasecmp(proto, "https")) : 0;
 }
 
 int ff_parse_creation_time_metadata(AVFormatContext *s, int64_t *timestamp, int return_seconds)
@@ -5140,20 +5676,8 @@ int ff_standardize_creation_time(AVFormatContext *s)
 {
     int64_t timestamp;
     int ret = ff_parse_creation_time_metadata(s, &timestamp, 0);
-    if (ret == 1) {
-        time_t seconds = timestamp / 1000000;
-        struct tm *ptm, tmbuf;
-        ptm = gmtime_r(&seconds, &tmbuf);
-        if (ptm) {
-            char buf[32];
-            if (!strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", ptm))
-                return AVERROR_EXTERNAL;
-            av_strlcatf(buf, sizeof(buf), ".%06dZ", (int)(timestamp % 1000000));
-            av_dict_set(&s->metadata, "creation_time", buf, 0);
-        } else {
-            return AVERROR_EXTERNAL;
-        }
-    }
+    if (ret == 1)
+        return avpriv_dict_set_timestamp(&s->metadata, "creation_time", timestamp);
     return ret;
 }
 
@@ -5203,4 +5727,100 @@ int ff_bprint_to_codecpar_extradata(AVCodecParameters *par, struct AVBPrint *buf
      * zeros. */
     par->extradata_size = buf->len;
     return 0;
+}
+
+int avformat_transfer_internal_stream_timing_info(const AVOutputFormat *ofmt,
+                                                  AVStream *ost, const AVStream *ist,
+                                                  enum AVTimebaseSource copy_tb)
+{
+    //TODO: use [io]st->internal->avctx
+    const AVCodecContext *dec_ctx;
+    AVCodecContext       *enc_ctx;
+
+#if FF_API_LAVF_AVCTX
+FF_DISABLE_DEPRECATION_WARNINGS
+    dec_ctx = ist->codec;
+    enc_ctx = ost->codec;
+FF_ENABLE_DEPRECATION_WARNINGS
+#else
+    dec_ctx = ist->internal->avctx;
+    enc_ctx = ost->internal->avctx;
+#endif
+
+    enc_ctx->time_base = ist->time_base;
+    /*
+     * Avi is a special case here because it supports variable fps but
+     * having the fps and timebase differe significantly adds quite some
+     * overhead
+     */
+    if (!strcmp(ofmt->name, "avi")) {
+#if FF_API_R_FRAME_RATE
+        if (copy_tb == AVFMT_TBCF_AUTO && ist->r_frame_rate.num
+            && av_q2d(ist->r_frame_rate) >= av_q2d(ist->avg_frame_rate)
+            && 0.5/av_q2d(ist->r_frame_rate) > av_q2d(ist->time_base)
+            && 0.5/av_q2d(ist->r_frame_rate) > av_q2d(dec_ctx->time_base)
+            && av_q2d(ist->time_base) < 1.0/500 && av_q2d(dec_ctx->time_base) < 1.0/500
+            || copy_tb == AVFMT_TBCF_R_FRAMERATE) {
+            enc_ctx->time_base.num = ist->r_frame_rate.den;
+            enc_ctx->time_base.den = 2*ist->r_frame_rate.num;
+            enc_ctx->ticks_per_frame = 2;
+        } else
+#endif
+            if (copy_tb == AVFMT_TBCF_AUTO && av_q2d(dec_ctx->time_base)*dec_ctx->ticks_per_frame > 2*av_q2d(ist->time_base)
+                   && av_q2d(ist->time_base) < 1.0/500
+                   || copy_tb == AVFMT_TBCF_DECODER) {
+            enc_ctx->time_base = dec_ctx->time_base;
+            enc_ctx->time_base.num *= dec_ctx->ticks_per_frame;
+            enc_ctx->time_base.den *= 2;
+            enc_ctx->ticks_per_frame = 2;
+        }
+    } else if (!(ofmt->flags & AVFMT_VARIABLE_FPS)
+               && !av_match_name(ofmt->name, "mov,mp4,3gp,3g2,psp,ipod,ismv,f4v")) {
+        if (copy_tb == AVFMT_TBCF_AUTO && dec_ctx->time_base.den
+            && av_q2d(dec_ctx->time_base)*dec_ctx->ticks_per_frame > av_q2d(ist->time_base)
+            && av_q2d(ist->time_base) < 1.0/500
+            || copy_tb == AVFMT_TBCF_DECODER) {
+            enc_ctx->time_base = dec_ctx->time_base;
+            enc_ctx->time_base.num *= dec_ctx->ticks_per_frame;
+        }
+    }
+
+    if ((enc_ctx->codec_tag == AV_RL32("tmcd") || ost->codecpar->codec_tag == AV_RL32("tmcd"))
+        && dec_ctx->time_base.num < dec_ctx->time_base.den
+        && dec_ctx->time_base.num > 0
+        && 121LL*dec_ctx->time_base.num > dec_ctx->time_base.den) {
+        enc_ctx->time_base = dec_ctx->time_base;
+    }
+
+    if (ost->avg_frame_rate.num)
+        enc_ctx->time_base = av_inv_q(ost->avg_frame_rate);
+
+    av_reduce(&enc_ctx->time_base.num, &enc_ctx->time_base.den,
+              enc_ctx->time_base.num, enc_ctx->time_base.den, INT_MAX);
+
+    return 0;
+}
+
+AVRational av_stream_get_codec_timebase(const AVStream *st)
+{
+    // See avformat_transfer_internal_stream_timing_info() TODO.
+#if FF_API_LAVF_AVCTX
+FF_DISABLE_DEPRECATION_WARNINGS
+    return st->codec->time_base;
+FF_ENABLE_DEPRECATION_WARNINGS
+#else
+    return st->internal->avctx->time_base;
+#endif
+}
+
+void ff_format_set_url(AVFormatContext *s, char *url)
+{
+    av_assert0(url);
+    av_freep(&s->url);
+    s->url = url;
+#if FF_API_FORMAT_FILENAME
+FF_DISABLE_DEPRECATION_WARNINGS
+    av_strlcpy(s->filename, url, sizeof(s->filename));
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
 }

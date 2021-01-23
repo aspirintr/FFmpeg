@@ -35,13 +35,7 @@ typedef struct TTAContext {
     int last_frame_size;
 } TTAContext;
 
-static unsigned long tta_check_crc(unsigned long checksum, const uint8_t *buf,
-                                   unsigned int len)
-{
-    return av_crc(av_crc_get_table(AV_CRC_32_IEEE_LE), checksum, buf, len);
-}
-
-static int tta_probe(AVProbeData *p)
+static int tta_probe(const AVProbeData *p)
 {
     if (AV_RL32(&p->buf[0]) == MKTAG('T', 'T', 'A', '1') &&
         (AV_RL16(&p->buf[4]) == 1 || AV_RL16(&p->buf[4]) == 2) &&
@@ -65,7 +59,7 @@ static int tta_read_header(AVFormatContext *s)
     start_offset = avio_tell(s->pb);
     if (start_offset < 0)
         return start_offset;
-    ffio_init_checksum(s->pb, tta_check_crc, UINT32_MAX);
+    ffio_init_checksum(s->pb, ff_crcEDB88320_update, UINT32_MAX);
     if (avio_rl32(s->pb) != AV_RL32("TTA1"))
         return AVERROR_INVALIDDATA;
 
@@ -121,7 +115,7 @@ static int tta_read_header(AVFormatContext *s)
     avio_seek(s->pb, start_offset, SEEK_SET);
     avio_read(s->pb, st->codecpar->extradata, st->codecpar->extradata_size);
 
-    ffio_init_checksum(s->pb, tta_check_crc, UINT32_MAX);
+    ffio_init_checksum(s->pb, ff_crcEDB88320_update, UINT32_MAX);
     for (i = 0; i < c->totalframes; i++) {
         uint32_t size = avio_rl32(s->pb);
         int r;
@@ -142,7 +136,7 @@ static int tta_read_header(AVFormatContext *s)
     st->codecpar->sample_rate = samplerate;
     st->codecpar->bits_per_coded_sample = bps;
 
-    if (s->pb->seekable) {
+    if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         int64_t pos = avio_tell(s->pb);
         ff_ape_parse_tag(s);
         avio_seek(s->pb, pos, SEEK_SET);
@@ -161,15 +155,15 @@ static int tta_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (c->currentframe >= c->totalframes)
         return AVERROR_EOF;
 
-    if (st->nb_index_entries < c->totalframes) {
+    if (st->internal->nb_index_entries < c->totalframes) {
         av_log(s, AV_LOG_ERROR, "Index entry disappeared\n");
         return AVERROR_INVALIDDATA;
     }
 
-    size = st->index_entries[c->currentframe].size;
+    size = st->internal->index_entries[c->currentframe].size;
 
     ret = av_get_packet(s->pb, pkt, size);
-    pkt->dts = st->index_entries[c->currentframe++].timestamp;
+    pkt->dts = st->internal->index_entries[c->currentframe++].timestamp;
     pkt->duration = c->currentframe == c->totalframes ? c->last_frame_size :
                                                         c->frame_size;
     return ret;
@@ -182,7 +176,7 @@ static int tta_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
     int index = av_index_search_timestamp(st, timestamp, flags);
     if (index < 0)
         return -1;
-    if (avio_seek(s->pb, st->index_entries[index].pos, SEEK_SET) < 0)
+    if (avio_seek(s->pb, st->internal->index_entries[index].pos, SEEK_SET) < 0)
         return -1;
 
     c->currentframe = index;

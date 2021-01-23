@@ -22,17 +22,20 @@
 
 #include "config.h"
 
-#if CONFIG_H264_MEDIACODEC_HWACCEL
+#include "libavutil/error.h"
+
+#include "mediacodec.h"
+
+#if CONFIG_MEDIACODEC
 
 #include <jni.h>
 
 #include "libavcodec/avcodec.h"
-#include "libavutil/atomic.h"
 #include "libavutil/mem.h"
 
 #include "ffjni.h"
-#include "mediacodec.h"
-#include "mediacodecdec.h"
+#include "mediacodecdec_common.h"
+#include "version.h"
 
 AVMediaCodecContext *av_mediacodec_alloc_context(void)
 {
@@ -43,9 +46,8 @@ int av_mediacodec_default_init(AVCodecContext *avctx, AVMediaCodecContext *ctx, 
 {
     int ret = 0;
     JNIEnv *env = NULL;
-    int attached = 0;
 
-    env = ff_jni_attach_env(&attached, avctx);
+    env = ff_jni_get_env(avctx);
     if (!env) {
         return AVERROR_EXTERNAL;
     }
@@ -58,17 +60,12 @@ int av_mediacodec_default_init(AVCodecContext *avctx, AVMediaCodecContext *ctx, 
         ret = AVERROR_EXTERNAL;
     }
 
-    if (attached) {
-        ff_jni_detach_env(avctx);
-    }
-
     return ret;
 }
 
 void av_mediacodec_default_free(AVCodecContext *avctx)
 {
     JNIEnv *env = NULL;
-    int attached = 0;
 
     AVMediaCodecContext *ctx = avctx->hwaccel_context;
 
@@ -76,7 +73,7 @@ void av_mediacodec_default_free(AVCodecContext *avctx)
         return;
     }
 
-    env = ff_jni_attach_env(&attached, avctx);
+    env = ff_jni_get_env(avctx);
     if (!env) {
         return;
     }
@@ -86,20 +83,36 @@ void av_mediacodec_default_free(AVCodecContext *avctx)
         ctx->surface = NULL;
     }
 
-    if (attached) {
-        ff_jni_detach_env(avctx);
-    }
-
     av_freep(&avctx->hwaccel_context);
 }
 
 int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
 {
     MediaCodecDecContext *ctx = buffer->ctx;
-    int released = avpriv_atomic_int_add_and_fetch(&buffer->released, 1);
+    int released = atomic_fetch_add(&buffer->released, 1);
 
-    if (released == 1) {
+    if (!released && (ctx->delay_flush || buffer->serial == atomic_load(&ctx->serial))) {
+        atomic_fetch_sub(&ctx->hw_buffer_count, 1);
+        av_log(ctx->avctx, AV_LOG_DEBUG,
+               "Releasing output buffer %zd (%p) ts=%"PRId64" with render=%d [%d pending]\n",
+               buffer->index, buffer, buffer->pts, render, atomic_load(&ctx->hw_buffer_count));
         return ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, render);
+    }
+
+    return 0;
+}
+
+int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time)
+{
+    MediaCodecDecContext *ctx = buffer->ctx;
+    int released = atomic_fetch_add(&buffer->released, 1);
+
+    if (!released && (ctx->delay_flush || buffer->serial == atomic_load(&ctx->serial))) {
+        atomic_fetch_sub(&ctx->hw_buffer_count, 1);
+        av_log(ctx->avctx, AV_LOG_DEBUG,
+               "Rendering output buffer %zd (%p) ts=%"PRId64" with time=%"PRId64" [%d pending]\n",
+               buffer->index, buffer, buffer->pts, time, atomic_load(&ctx->hw_buffer_count));
+        return ff_AMediaCodec_releaseOutputBufferAtTime(ctx->codec, buffer->index, time);
     }
 
     return 0;
@@ -109,8 +122,6 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
 
 #include <stdlib.h>
 
-#include "mediacodec.h"
-
 AVMediaCodecContext *av_mediacodec_alloc_context(void)
 {
     return NULL;
@@ -118,7 +129,7 @@ AVMediaCodecContext *av_mediacodec_alloc_context(void)
 
 int av_mediacodec_default_init(AVCodecContext *avctx, AVMediaCodecContext *ctx, void *surface)
 {
-    return 0;
+    return AVERROR(ENOSYS);
 }
 
 void av_mediacodec_default_free(AVCodecContext *avctx)
@@ -127,7 +138,12 @@ void av_mediacodec_default_free(AVCodecContext *avctx)
 
 int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
 {
-    return 0;
+    return AVERROR(ENOSYS);
+}
+
+int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time)
+{
+    return AVERROR(ENOSYS);
 }
 
 #endif

@@ -19,6 +19,7 @@
  */
 
 #include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 
 #include "dcadsp.h"
 #include "dcamath.h"
@@ -300,7 +301,7 @@ static void decor_c(int32_t *dst, const int32_t *src, int coeff, ptrdiff_t len)
     int i;
 
     for (i = 0; i < len; i++)
-        dst[i] += src[i] * coeff + (1 << 2) >> 3;
+        dst[i] += (SUINT)((int)(src[i] * (SUINT)coeff + (1 << 2)) >> 3);
 }
 
 static void dmix_sub_xch_c(int32_t *dst1, int32_t *dst2,
@@ -320,7 +321,7 @@ static void dmix_sub_c(int32_t *dst, const int32_t *src, int coeff, ptrdiff_t le
     int i;
 
     for (i = 0; i < len; i++)
-        dst[i] -= mul15(src[i], coeff);
+        dst[i] -= (unsigned)mul15(src[i], coeff);
 }
 
 static void dmix_add_c(int32_t *dst, const int32_t *src, int coeff, ptrdiff_t len)
@@ -347,7 +348,7 @@ static void dmix_scale_inv_c(int32_t *dst, int scale_inv, ptrdiff_t len)
         dst[i] = mul16(dst[i], scale_inv);
 }
 
-static void filter0(int32_t *dst, const int32_t *src, int32_t coeff, ptrdiff_t len)
+static void filter0(SUINT32 *dst, const int32_t *src, int32_t coeff, ptrdiff_t len)
 {
     int i;
 
@@ -355,7 +356,7 @@ static void filter0(int32_t *dst, const int32_t *src, int32_t coeff, ptrdiff_t l
         dst[i] -= mul22(src[i], coeff);
 }
 
-static void filter1(int32_t *dst, const int32_t *src, int32_t coeff, ptrdiff_t len)
+static void filter1(SUINT32 *dst, const int32_t *src, int32_t coeff, ptrdiff_t len)
 {
     int i;
 

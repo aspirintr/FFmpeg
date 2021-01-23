@@ -65,14 +65,11 @@ static av_cold int ra144_encode_init(AVCodecContext * avctx)
     ret = ff_lpc_init(&ractx->lpc_ctx, avctx->frame_size, LPC_ORDER,
                       FF_LPC_TYPE_LEVINSON);
     if (ret < 0)
-        goto error;
+        return ret;
 
     ff_af_queue_init(avctx, &ractx->afq);
 
     return 0;
-error:
-    ra144_encode_close(avctx);
-    return ret;
 }
 
 
@@ -475,10 +472,10 @@ static int ra144_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
 
     ff_lpc_calc_coefs(&ractx->lpc_ctx, lpc_data, NBLOCKS * BLOCKSIZE, LPC_ORDER,
                       LPC_ORDER, 16, lpc_coefs, shift, FF_LPC_TYPE_LEVINSON,
-                      0, ORDER_METHOD_EST, 12, 0);
+                      0, ORDER_METHOD_EST, 0, 12, 0);
     for (i = 0; i < LPC_ORDER; i++)
-        block_coefs[NBLOCKS - 1][i] = -(lpc_coefs[LPC_ORDER - 1][i] <<
-                                        (12 - shift[LPC_ORDER - 1]));
+        block_coefs[NBLOCKS - 1][i] = -lpc_coefs[LPC_ORDER - 1][i]
+                                       * (1 << (12 - shift[LPC_ORDER - 1]));
 
     /**
      * TODO: apply perceptual weighting of the input speech through bandwidth

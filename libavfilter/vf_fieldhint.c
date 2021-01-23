@@ -65,7 +65,7 @@ static av_cold int init(AVFilterContext *ctx)
         av_log(ctx, AV_LOG_ERROR, "Hint file must be set.\n");
         return AVERROR(EINVAL);
     }
-    s->hint = fopen(s->hint_file_str, "r");
+    s->hint = av_fopen_utf8(s->hint_file_str, "r");
     if (!s->hint) {
         ret = AVERROR(errno);
         av_log(ctx, AV_LOG_ERROR, "%s: %s\n", s->hint_file_str, av_err2str(ret));
@@ -77,19 +77,16 @@ static av_cold int init(AVFilterContext *ctx)
 
 static int query_formats(AVFilterContext *ctx)
 {
-    AVFilterFormats *pix_fmts = NULL;
-    int fmt, ret;
+    AVFilterFormats *formats = NULL;
+    int ret;
 
-    for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
-        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
-        if (!(desc->flags & AV_PIX_FMT_FLAG_HWACCEL ||
-              desc->flags & AV_PIX_FMT_FLAG_PAL     ||
-              desc->flags & AV_PIX_FMT_FLAG_BITSTREAM) &&
-            (ret = ff_add_format(&pix_fmts, fmt)) < 0)
-            return ret;
-    }
-
-    return ff_set_common_formats(ctx, pix_fmts);
+    ret = ff_formats_pixdesc_filter(&formats, 0,
+                                    AV_PIX_FMT_FLAG_HWACCEL |
+                                    AV_PIX_FMT_FLAG_BITSTREAM |
+                                    AV_PIX_FMT_FLAG_PAL);
+    if (ret < 0)
+        return ret;
+    return ff_set_common_formats(ctx, formats);
 }
 
 static int config_input(AVFilterLink *inlink)
@@ -117,7 +114,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out, *top, *bottom;
     char buf[1024] = { 0 };
     int64_t tf, bf;
-    char hint = '=';
+    int tfactor = 0, bfactor = 1;
+    char hint = '=', field = '=';
     int p;
 
     av_frame_free(&s->frame[0]);
@@ -137,6 +135,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             s->line++;
             if (buf[0] == '#' || buf[0] == ';') {
                 continue;
+            } else if (sscanf(buf, "%"PRId64",%"PRId64" %c %c", &tf, &bf, &hint, &field) == 4) {
+                ;
             } else if (sscanf(buf, "%"PRId64",%"PRId64" %c", &tf, &bf, &hint) == 3) {
                 ;
             } else if (sscanf(buf, "%"PRId64",%"PRId64"", &tf, &bf) == 2) {
@@ -147,22 +147,22 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             }
             switch (s->mode) {
             case 0:
-                if (tf > outlink->frame_count + 1 || tf < FFMAX(0, outlink->frame_count - 1) ||
-                    bf > outlink->frame_count + 1 || bf < FFMAX(0, outlink->frame_count - 1)) {
-                    av_log(ctx, AV_LOG_ERROR, "Out of range frames %"PRId64" and/or %"PRId64" on line %"PRId64" for %"PRId64". input frame.\n", tf, bf, s->line, inlink->frame_count);
+                if (tf > outlink->frame_count_in + 1 || tf < FFMAX(0, outlink->frame_count_in - 1) ||
+                    bf > outlink->frame_count_in + 1 || bf < FFMAX(0, outlink->frame_count_in - 1)) {
+                    av_log(ctx, AV_LOG_ERROR, "Out of range frames %"PRId64" and/or %"PRId64" on line %"PRId64" for %"PRId64". input frame.\n", tf, bf, s->line, inlink->frame_count_out);
                     return AVERROR_INVALIDDATA;
                 }
                 break;
             case 1:
                 if (tf > 1 || tf < -1 ||
                     bf > 1 || bf < -1) {
-                    av_log(ctx, AV_LOG_ERROR, "Out of range %"PRId64" and/or %"PRId64" on line %"PRId64" for %"PRId64". input frame.\n", tf, bf, s->line, inlink->frame_count);
+                    av_log(ctx, AV_LOG_ERROR, "Out of range %"PRId64" and/or %"PRId64" on line %"PRId64" for %"PRId64". input frame.\n", tf, bf, s->line, inlink->frame_count_out);
                     return AVERROR_INVALIDDATA;
                 }
             };
             break;
         } else {
-            av_log(ctx, AV_LOG_ERROR, "Missing entry for %"PRId64". input frame.\n", inlink->frame_count);
+            av_log(ctx, AV_LOG_ERROR, "Missing entry for %"PRId64". input frame.\n", inlink->frame_count_out);
             return AVERROR_INVALIDDATA;
         }
     }
@@ -174,8 +174,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     switch (s->mode) {
     case 0:
-        top    = s->frame[tf - outlink->frame_count + 1];
-        bottom = s->frame[bf - outlink->frame_count + 1];
+        top    = s->frame[tf - outlink->frame_count_in + 1];
+        bottom = s->frame[bf - outlink->frame_count_in + 1];
         break;
     case 1:
         top    = s->frame[1 + tf];
@@ -183,6 +183,23 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         break;
     default:
         av_assert0(0);
+    }
+
+    switch (field) {
+    case 'b':
+        tfactor = 1;
+        top = bottom;
+        break;
+    case 't':
+        bfactor = 0;
+        bottom = top;
+        break;
+    case '=':
+        break;
+    default:
+        av_log(ctx, AV_LOG_ERROR, "Invalid field: %c.\n", field);
+        av_frame_free(&out);
+        return AVERROR(EINVAL);
     }
 
     switch (hint) {
@@ -194,21 +211,30 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         break;
     case '=':
         break;
+    case 'b':
+        tfactor = 1;
+        top = bottom;
+        break;
+    case 't':
+        bfactor = 0;
+        bottom = top;
+        break;
     default:
         av_log(ctx, AV_LOG_ERROR, "Invalid hint: %c.\n", hint);
+        av_frame_free(&out);
         return AVERROR(EINVAL);
     }
 
     for (p = 0; p < s->nb_planes; p++) {
         av_image_copy_plane(out->data[p],
                             out->linesize[p] * 2,
-                            top->data[p],
+                            top->data[p] + tfactor * top->linesize[p],
                             top->linesize[p] * 2,
                             s->planewidth[p],
                             (s->planeheight[p] + 1) / 2);
         av_image_copy_plane(out->data[p] + out->linesize[p],
                             out->linesize[p] * 2,
-                            bottom->data[p] + bottom->linesize[p],
+                            bottom->data[p] + bfactor * bottom->linesize[p],
                             bottom->linesize[p] * 2,
                             s->planewidth[p],
                             (s->planeheight[p] + 1) / 2);
