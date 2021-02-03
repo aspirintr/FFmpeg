@@ -640,24 +640,15 @@ extern HWDevice *filter_hw_device;
 void term_init(void);
 void term_exit(void);
 
-void reset_options(OptionsContext *o, int is_input);
 void show_usage(void);
-
-void opt_output_file(void *optctx, const char *filename);
 
 void remove_avoptions(AVDictionary **a, AVDictionary *b);
 void assert_avoptions(AVDictionary *m);
 
 int guess_input_channel_layout(InputStream *ist);
 
-enum AVPixelFormat choose_pixel_fmt(AVStream *st, AVCodecContext *avctx,
-                                    const AVCodec *codec, enum AVPixelFormat target);
-void choose_sample_fmt(AVStream *st, const AVCodec *codec);
-
 int configure_filtergraph(FilterGraph *fg);
-int configure_output_filter(FilterGraph *fg, OutputFilter *ofilter, AVFilterInOut *out);
 void check_filter_outputs(void);
-int ist_in_filtergraph(FilterGraph *fg, InputStream *ist);
 int filtergraph_is_simple(FilterGraph *fg);
 int init_simple_filtergraph(InputStream *ist, OutputStream *ost);
 int init_complex_filtergraph(FilterGraph *fg);
